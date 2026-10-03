@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { fsa } from 'memfs/lib/fsa';
 import { FileLibrary } from '../core/fileLibrary';
+import { createMemoryBlobStore } from '../core/blobStore';
 import { createMemoryStore } from '../core/keyValueStore';
 import { findByPath, pathOf } from '../core/libraryTree';
 import { extensionPolicy } from '../core/policy';
@@ -165,7 +166,7 @@ describe('FileLibrary — linked folder', () => {
     await library.link(root);
     const kickId = findByPath(library.tree, ['drums', 'kick.json'])!.id;
     expect(library.unlinkSummary()).toEqual({ folders: 1, openable: 2, otherFiles: 2 });
-    await library.unlink();
+    await library.unlink({ keep: true });
     expect(library.mode.kind).toBe('memory');
     expect(findByPath(library.tree, ['drums', 'kick.wav'])).toBeUndefined();
     expect(findByPath(library.tree, ['notes.txt'])).toBeUndefined();
@@ -242,15 +243,31 @@ describe('FileLibrary — binary policy (videos)', () => {
     expect(library.unlinkSummary()).toEqual({ folders: 1, openable: 2, otherFiles: 1 });
   });
 
-  it('UNLINK keeps the folder structure but never copies a video into memory', async () => {
+  it('UNLINK + KEEP streams videos into the blob store, never into the key-value store', async () => {
+    const store = createMemoryStore();
+    const blobStore = createMemoryBlobStore();
+    const library = new FileLibrary({ store, policy: videoPolicy, blobStore });
+    await library.init();
+    const root = await makeFolder({ 'show/ep01.mkv': 'video bytes', 'show/ep01.srt': 's', 'film.mp4': 'film' });
+    await library.link(root);
+    await library.unlink({ keep: true });
+    expect(library.mode.kind).toBe('memory');
+    const episode = findByPath(library.tree, ['show', 'ep01.mkv'])!;
+    expect(await (await library.getFile(episode.id)).text()).toBe('video bytes');
+    // Not openable, so it stays on disk only.
+    expect(findByPath(library.tree, ['show', 'ep01.srt'])).toBeUndefined();
+    expect((await blobStore.keys()).sort()).toEqual([episode.id, findByPath(library.tree, ['film.mp4'])!.id].sort());
+    expect((await store.keys()).filter((key) => key.startsWith('file:'))).toEqual([]);
+  });
+
+  it('UNLINK + REMOVE leaves an empty library: no leftover folders', async () => {
     const { library } = await videoLibrary();
     const root = await makeFolder({ 'show/ep01.mkv': 'video bytes', 'film.mp4': 'video bytes' });
     await library.link(root);
-    await library.unlink();
+    await library.unlink({ keep: false });
     expect(library.mode.kind).toBe('memory');
-    expect(findByPath(library.tree, ['show'])).toBeDefined();
-    expect(findByPath(library.tree, ['show', 'ep01.mkv'])).toBeUndefined();
-    expect(findByPath(library.tree, ['film.mp4'])).toBeUndefined();
+    expect(Object.keys(library.tree.nodes)).toEqual([library.tree.rootId]);
+    expect(await readDisk(root, 'show/ep01.mkv')).toBe('video bytes'); // the disk is untouched
   });
 
   it('a deleted video is not held for undo, and undo never recreates it empty', async () => {

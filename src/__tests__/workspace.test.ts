@@ -516,7 +516,7 @@ describe('Workspace — library operations', () => {
     await open(ids['a.json']);
     expect(await ws.remove([ids['a.json']])).toBe(true);
     expect(requests).toEqual([
-      { kind: 'delete', label: '"a.json"', onDisk: false, openable: 1, otherFiles: 0, hidden: 0 },
+      { kind: 'delete', label: '"a.json"', onDisk: false, openable: 1, otherFiles: 0, hidden: 0, permanent: 0 },
     ]);
     expect(ws.getSnapshot().tabs.order).toEqual([WELCOME]);
     expect(ws.getSnapshot().activeFileId).toBeNull();

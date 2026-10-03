@@ -133,6 +133,16 @@
     --efm-warning: #ffa500;
     --efm-danger: #ff4444;
     --efm-success: #4caf50;
+    /* Text on an accent- or danger-coloured button. */
+    --efm-on-accent: #ffffff;
+    /* The dialogs' backdrop. */
+    --efm-overlay: rgb(0 0 0 / 0.6);
+    /* OPTIONAL tokens, deliberately NOT declared here: a declaration on
+       `:root` that read `var(--efm-accent)` would be resolved ON `:root`, so a
+       subtree overriding `--efm-accent` would no longer move them. Each use
+       site falls back instead:
+         --efm-focus      focus rings              (falls back to --efm-accent)
+         --efm-selection  the open file's tree row (falls back to --efm-accent at 25%) */
   }
 }
 
@@ -153,4 +163,8 @@
   --color-warning: var(--efm-warning);
   --color-danger: var(--efm-danger);
   --color-success: var(--efm-success);
+  --color-on-accent: var(--efm-on-accent);
+  /* The fallback is for browsers whose `::backdrop` does not inherit custom
+     properties from its dialog (before Chrome 122 / Firefox 120 / Safari 17.4). */
+  --color-overlay: var(--efm-overlay, rgb(0 0 0 / 0.6));
 }

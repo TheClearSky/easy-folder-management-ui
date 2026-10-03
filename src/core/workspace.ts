@@ -27,12 +27,13 @@
  * where each was found and live-verified. W1–W3 are fixes made while
  * porting (no review id): see the comments where they apply.
  *
- * Prompts are never made here: `confirm` and `confirmUnsaved` are injected.
+ * Prompts are never made here: `confirm`, `chooseUnlink` and
+ * `confirmUnsaved` are injected.
  */
 
 import { ConflictError } from './backends';
-import type { WriteData } from './backends';
-import type { FileLibrary, LibrarySnapshot } from './fileLibrary';
+import type { FolderAccess, WriteData } from './backends';
+import type { FileLibrary, LibrarySnapshot, UnlinkPlan, UnlinkProgress } from './fileLibrary';
 import { findByPath, isOpenableFile, pathOf, subtreeIds } from './libraryTree';
 import type { LibraryNode, LibraryTree } from './libraryTree';
 import { SaveController } from './saveController';
@@ -128,19 +129,12 @@ interface Journal {
   bootPath(): readonly string[] | null;
 }
 
-/** What `confirm` is asked. The app words it. */
+/** What `confirm` is asked. The app words it. (Unlinking has its own
+ *  three-way prompt, `chooseUnlink`.) */
 type ConfirmRequest =
-  /** Linking replaces a non-empty in-browser library. */
+  /** Linking replaces a non-empty in-browser library (its files are deleted
+   *  from the browser). */
   | { kind: 'link'; folderName: string; openable: number; folders: number }
-  /** `mode: 'folder'` copies into the browser; `'forget'` drops a folder
-   *  awaiting reconnection. */
-  | {
-      kind: 'unlink';
-      mode: 'folder' | 'forget';
-      openable: number;
-      folders: number;
-      otherFiles: number;
-    }
   | {
       kind: 'delete';
       /** `"name"` or `N items`. */
@@ -148,12 +142,19 @@ type ConfirmRequest =
       /** Deleted from the disk, not just the browser. */
       onDisk: boolean;
       openable: number;
-      /** Files inside that are not openable (kept for undo only if the
-       *  policy says so). */
+      /** Files inside that are not openable. */
       otherFiles: number;
       /** Entries the tree does not show (`.git`) that go too. */
       hidden: number;
+      /** Files `undoDelete()` can NOT bring back (the policy's `keepForUndo`
+       *  refuses them — every binary file by default). `0` means the whole
+       *  delete can be undone until the page is reloaded. */
+      permanent: number;
     };
+
+/** UNLINK: copy the folder into the browser (`'keep'`), end up with an empty
+ *  in-browser library (`'remove'`), or do nothing. */
+type UnlinkChoice = 'keep' | 'remove' | 'cancel';
 
 type UnsavedChoice = 'save' | 'discard' | 'cancel';
 
@@ -186,6 +187,10 @@ interface WorkspaceOptions<Content, Snapshot = never> {
   confirmUnsaved?(names: readonly string[]): Promise<UnsavedChoice>;
   /** Destructive library operations. Without it, they proceed. */
   confirm?(request: ConfirmRequest): Promise<boolean>;
+  /** UNLINK: KEEP a copy in the browser, REMOVE, or cancel — shown with the
+   *  measured plan (sizes, free space, whether it fits). Without it, unlink
+   *  KEEPs (or forgets a folder awaiting reconnection). */
+  chooseUnlink?(plan: UnlinkPlan): Promise<UnlinkChoice>;
   /** Closing non-file tabs (e.g. "Stop watching this stream?"). `false`
    *  cancels the whole close. */
   beforeCloseTabs?(ids: readonly TabId[]): Promise<boolean>;
@@ -1368,6 +1373,7 @@ class Workspace<Content = unknown, Snapshot = never> {
       openable,
       otherFiles: files.length - openable,
       hidden,
+      permanent: files.filter((node) => !policy.keepForUndo(node)).length,
     });
     if (!confirmed) return false;
     const activeGone = this.current !== null && affected.includes(this.current);
@@ -1407,8 +1413,15 @@ class Workspace<Content = unknown, Snapshot = never> {
    * The in-browser library is discarded: every file tab closes and the
    * discarded files' unsaved buffers go too — they would otherwise haunt
    * every reload with "Leave site?" (E3).
+   *
+   * `access` is what the user chose for this folder (ask before the picker,
+   * and pick with the same mode: `pickFolder({ access })`). Default: the
+   * library's `access` option.
    */
-  async link(handle: FileSystemDirectoryHandle): Promise<boolean> {
+  async link(
+    handle: FileSystemDirectoryHandle,
+    linkOptions: { access?: FolderAccess } = {},
+  ): Promise<boolean> {
     if (this.sessionReadOnly) return false;
     const { openable, folders } = this.library.unlinkSummary();
     if (
@@ -1422,7 +1435,7 @@ class Workspace<Content = unknown, Snapshot = never> {
     await this.saveController?.flush().catch(() => {});
     const discarded = Object.keys(this.library.tree.nodes);
     try {
-      await this.library.link(handle);
+      await this.library.link(handle, linkOptions);
     } catch {
       return false; // the library's error says why
     }
@@ -1436,31 +1449,44 @@ class Workspace<Content = unknown, Snapshot = never> {
   }
 
   /**
-   * UNLINK after `confirm`. Ids are kept, so the open file stays open (now
-   * in the browser) — unless it is showing "Unsupported", which must stay
-   * unwritable (E6), or was not copied (the policy keeps binaries on disk).
+   * UNLINK: measure (`library.planUnlink()`), ask `chooseUnlink` — KEEP a
+   * copy in the browser, REMOVE, or cancel — then do it. A KEEP copy reports
+   * progress (`onProgress`, and `snapshot.library.unlinkProgress`) and can
+   * be cancelled (`signal`, or `cancelUnlink()`); a failed or cancelled copy
+   * leaves the folder linked and unchanged, and resolves `false`.
+   *
+   * KEEP keeps ids, so the open file stays open (now in the browser) —
+   * unless it is showing "Unsupported", which must stay unwritable (E6).
+   * Tabs of files that are no longer in the library (REMOVE, or files the
+   * policy leaves on disk) close.
    */
-  async unlink(): Promise<boolean> {
+  async unlink(
+    unlinkOptions: { signal?: AbortSignal; onProgress?(progress: UnlinkProgress): void } = {},
+  ): Promise<boolean> {
     if (this.sessionReadOnly) return false;
-    const summary = this.library.unlinkSummary();
-    const wasFolder = this.library.mode.kind === 'folder';
-    const confirmed = await this.ask({
-      kind: 'unlink',
-      mode: wasFolder ? 'folder' : 'forget',
-      openable: summary.openable,
-      folders: summary.folders,
-      otherFiles: summary.otherFiles,
-    });
-    if (!confirmed) return false;
+    let plan: UnlinkPlan;
+    try {
+      plan = await this.library.planUnlink();
+    } catch {
+      return false; // the library's error says why
+    }
+    const choice: UnlinkChoice = this.options.chooseUnlink
+      ? await this.options.chooseUnlink(plan)
+      : plan.mode === 'folder'
+        ? 'keep'
+        : 'remove';
+    if (choice === 'cancel') return false;
+    const keep = choice === 'keep' && plan.mode === 'folder';
     this.flushPendingChange();
     await this.saveController?.flush().catch(() => {});
     try {
-      await this.library.unlink();
+      await this.library.unlink({ keep, signal: unlinkOptions.signal, onProgress: unlinkOptions.onProgress });
     } catch {
-      return false;
+      return false; // still linked; the library's error (or notice) says why
     }
+    const tree = this.library.tree;
     const active = this.current;
-    if (wasFolder && active !== null && this.library.tree.nodes[active] && this.failure?.fileId !== active) {
+    if (keep && active !== null && tree.nodes[active] && this.failure?.fileId !== active) {
       this.saveController?.setWritable(this.writable());
       this.rememberOpen(active);
     } else {
@@ -1468,8 +1494,46 @@ class Workspace<Content = unknown, Snapshot = never> {
       await this.detachEditor();
       if (shownGone) this.detachedState = true;
     }
+    // Files no longer in the library: their tabs go, without asking (the
+    // user chose this), and with them their buffers and snapshots.
+    const gone = this.tabsState.order
+      .map((id) => this.fileIdOf(id))
+      .filter((fileId): fileId is string => fileId !== null && !tree.nodes[fileId]);
+    if (gone.length > 0) {
+      this.forget(gone);
+      if (this.failure && gone.includes(this.failure.fileId)) this.failure = null;
+      await this.dropTabs(gone.map((fileId) => this.fileTabId(fileId)));
+    }
     this.emit();
     return true;
+  }
+
+  /** Cancel a KEEP copy in progress; the folder stays linked. */
+  cancelUnlink(): void {
+    this.library.cancelUnlink();
+  }
+
+  /**
+   * Switch the linked folder between read-only and read & write (persisted
+   * for this folder). An UPGRADE asks the browser — call it straight from
+   * the click; the request is the first thing that happens. A refusal keeps
+   * it read-only (the library's `notice` says so). A DOWNGRADE first saves
+   * the open file's pending edit, then waits for queued writes. Resolves
+   * whether the folder now has `access`.
+   */
+  async setFolderAccess(access: FolderAccess): Promise<boolean> {
+    if (this.sessionReadOnly) return false;
+    if (access === 'read') {
+      this.flushPendingChange();
+      await this.saveController?.flush().catch(() => {});
+    }
+    const done = await this.library.setAccess(access); // upgrade: NO await before this (FB-28)
+    const active = this.current;
+    if (active !== null && !this.failure && !this.conflictState) {
+      this.saveController?.setWritable(this.writable());
+    }
+    this.emit();
+    return done;
   }
 
   /**
@@ -1477,11 +1541,14 @@ class Workspace<Content = unknown, Snapshot = never> {
    * the permission request is the FIRST thing that happens, with no await
    * before it, or the click's user activation is spent (FB-28). Then the
    * remembered tabs come back (and an adoptable journal).
+   *
+   * `access: 'read'` continues read-only a folder linked read & write whose
+   * write permission the browser no longer holds (remembered as its mode).
    */
-  async reconnect(): Promise<boolean> {
+  async reconnect(reconnectOptions: { access?: FolderAccess } = {}): Promise<boolean> {
     if (this.sessionReadOnly) return false;
     try {
-      await this.library.reconnect(); // NO await before this line (FB-28)
+      await this.library.reconnect(reconnectOptions); // NO await before this line (FB-28)
     } catch {
       return false;
     }
@@ -1627,6 +1694,7 @@ export type {
   OpenFailure,
   SaveConflict,
   SaveStatus,
+  UnlinkChoice,
   UnsavedChoice,
   WorkspaceOptions,
   WorkspaceSnapshot,

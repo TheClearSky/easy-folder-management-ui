@@ -1,6 +1,6 @@
 {
   "name": "@theclearsky/easy-folder-management-ui",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "description": "VS Code-style file library and tabs for web apps: linked local folders (File System Access), in-browser storage, a file tree sidebar and a tab strip — headless core, React hooks and styled components.",
   "license": "MIT",
   "author": "Deepak Prasad <TheClearSky@github.com>",
@@ -51,6 +51,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && vite build && node --experimental-strip-types scripts/check-dist.ts",
     "type-check": "tsc -p tsconfig.json",
+    "playground": "vite --config playground/vite.config.ts",
     "test:unit": "vitest run",
     "test:unit:watch": "vitest",
     "pretty": "prettier --write .",

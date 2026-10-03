@@ -1,0 +1,8 @@
+/* The playground's OWN Tailwind — what a consuming app has, so the custom
+   "warm" theme (playground/themes.ts) can use plain, UNPREFIXED classes the
+   way an app's theme would. Utilities only, scanning playground/ only: still
+   NO preflight, so the page stays the preflight-dependency oracle (the
+   library must look right without any reset). */
+@layer theme, base, components, utilities;
+@import 'tailwindcss/theme.css' layer(theme) source('.');
+@import 'tailwindcss/utilities.css' layer(utilities) source('.');
