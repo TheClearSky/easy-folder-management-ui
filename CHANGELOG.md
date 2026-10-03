@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.0.1 — unreleased
+## 0.0.2 — 2026-10-03
+
+Documentation release; no code changes.
+
+- A new README: what it is and why, a screenshot, a complete quick start (a Markdown notes app with autosave),
+  recipes (read-only video library, streamed and resumed writes, app-owned tab kinds, preview tabs), the API at a
+  glance, theming variables, browser support, and the projects that use it. Every code sample is type-checked
+  against the published API.
+- `package.json` gains `homepage` and `bugs` links (shown on npm).
+
+## 0.0.1 — 2026-10-03
 
 First release. Extracted from Nodestra's graph library and tabs (byte-copied, see `PROVENANCE.md`), then
 generalized.
@@ -10,7 +20,7 @@ generalized.
 - `FileLibrary`: one tree over a browser store (`MemoryBackend`, IndexedDB) or a linked folder (`FolderBackend`,
   File System Access) — serial queue, mutation guard, link / unlink / reconnect / rescan, session undo of deletes,
   conflict detection; `access: 'read'` links; binary-safe `getFile`, `write(WriteData)` with streams and `at`
-  (resume); streamed folder copies; `pickFolder()`.
+  (resume); streamed folder copies; `pickFolder()`; `requestWriteAccess()` upgrades a read-only link from a click.
 - Tabs: `tabsReducer` (MRU, reopen, reorder, opt-in `preview` + `promote`), `tabId` / `parseTabId` /
   `defineTabKinds`, `createTabRecordStore` (reads Nodestra's stored records unchanged).
 - `SaveController` and `Workspace` with a `DocumentAdapter`: open / switch / close with race guards, snapshots,
