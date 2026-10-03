@@ -1,0 +1,101 @@
+{
+  "name": "@theclearsky/easy-folder-management-ui",
+  "version": "0.0.1",
+  "description": "VS Code-style file library and tabs for web apps: linked local folders (File System Access), in-browser storage, a file tree sidebar and a tab strip — headless core, React hooks and styled components.",
+  "license": "MIT",
+  "author": "Deepak Prasad <TheClearSky@github.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheClearSky/easy-folder-management-ui.git"
+  },
+  "keywords": [
+    "file-system-access",
+    "file-tree",
+    "tabs",
+    "vscode",
+    "opfs",
+    "indexeddb",
+    "react",
+    "typescript"
+  ],
+  "type": "module",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react.js",
+      "require": "./dist/react.cjs"
+    },
+    "./ui": {
+      "types": "./dist/ui/index.d.ts",
+      "import": "./dist/ui.js",
+      "require": "./dist/ui.cjs"
+    },
+    "./styles.css": "./dist/styles.css",
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build && node --experimental-strip-types scripts/check-dist.ts",
+    "type-check": "tsc -p tsconfig.json",
+    "test:unit": "vitest run",
+    "test:unit:watch": "vitest",
+    "pretty": "prettier --write .",
+    "pretty:check": "prettier --check ."
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^24.19.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "jsdom": "^29.1.1",
+    "memfs": "^4.79.0",
+    "prettier": "^3.9.9",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~5.9.2",
+    "vite": "^7.3.6",
+    "vite-plugin-dts": "^4.5.4",
+    "vitest": "^3.2.7"
+  },
+  "dependencies": {
+    "@headless-tree/core": "^1.7.0",
+    "@headless-tree/react": "^1.7.0",
+    "@radix-ui/react-context-menu": "^2.3.7",
+    "@radix-ui/react-dropdown-menu": "^2.1.24",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.7.0"
+  }
+}

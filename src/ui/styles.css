@@ -1,0 +1,156 @@
+/* Stylesheet for @theclearsky/easy-folder-management-ui — import it once:
+ *
+ *   import '@theclearsky/easy-folder-management-ui/styles.css';
+ *
+ * Tailwind v4, compiled at build time and shipped; consumers need no Tailwind.
+ * Every utility is namespaced `efm:` and PREFLIGHT is left out, so this sheet
+ * cannot restyle anything of the host page and the host page's own Tailwind
+ * cannot collide with it. The base layer below is the timeline plugin's
+ * (`react-blender-nodes-timeline/src/style.css`), with its prefix replaced —
+ * the same audited set of scoped resets, including the four the host's audit
+ * found preflight had been silently providing.
+ *
+ * THEMING: override the public `--efm-*` variables (declared OUTSIDE `@theme`
+ * on purpose — `prefix()` renames `@theme` variables, so only these names are
+ * stable), on `:root` or on any ancestor of the components.
+ */
+/* SPLIT, not the monolithic `@import 'tailwindcss'`, so PREFLIGHT is left out
+   (react-blender-nodes `src/index.css` has the full reasoning: a shipped
+   preflight restyles the consumer's whole page). The load-bearing resets are
+   re-declared below, scoped to this package's own prefix. */
+@layer theme, base, components, utilities;
+@import 'tailwindcss/theme.css' layer(theme) source('.');
+@import 'tailwindcss/utilities.css' layer(utilities) source('.');
+
+/* Every utility this package emits is namespaced `efm:`, disjoint from the
+   other first-party prefixes (`rbn:` host, `rbnt:` timeline): `[class*='efm:']`
+   matches none of their classes and theirs match none of ours, so each sheet's
+   scoped base resets reach only its own markup, and no two sheets define the
+   same selector (the cross-sheet ordering bug the prefixes exist to remove).
+   The package's own `cn` (src/ui/cn.ts) strips `efm:` before merging, so a
+   consumer's unprefixed class wins a conflict with a default here. */
+@theme prefix(efm) {
+}
+
+@layer base {
+  [class*='efm:'],
+  [class*='efm:']::before,
+  [class*='efm:']::after {
+    box-sizing: border-box;
+    border: 0 solid;
+    margin: 0;
+    padding: 0;
+    /* Preflight set the sans stack on `html`; without a scoped replacement
+       everything falls back to the browser's default SERIF (measured in the
+       host: "Times New Roman" on every panel and button). `--efm-font` is a
+       public token (below); it defaults to inheriting the page's font. */
+    font-family: var(--efm-font);
+    /* Preflight set this on `html` too. Without it every sized span that
+       declares no leading of its own falls back to `normal` (~1.2) instead of
+       1.5. Utilities sit in a later layer than `base`, so an explicit
+       `leading-*` still wins. react-blender-nodes `src/index.css` records the audit
+       that measured this. */
+    line-height: 1.5;
+  }
+
+  /* Preflight's `*` reset also gave border-box to elements carrying no class
+     of ours — unclassed wrappers and nested library markup. `:where()` keeps
+     specificity at ZERO so any consumer rule beats it, which matters because
+     this is the one rule here that can reach a consumer's own `children`. */
+  :where([class*='efm:'] *) {
+    box-sizing: border-box;
+  }
+  [class*='efm:'] :where(p, ul, ol, menu, li, figure, blockquote, dl, dd) {
+    margin: 0;
+    padding: 0;
+  }
+  [class*='efm:'] :where(ul, ol, menu) {
+    list-style: none;
+  }
+  /* Preflight removed the UA font-size/weight from headings; without it any
+     heading this package renders (directly or through a primitive like Radix's
+     `Accordion.Header`, which emits an `<h3>`) comes back bold and 1.17em.
+     See react-blender-nodes' `src/index.css` and its audit script. */
+  :where(h1, h2, h3, h4, h5, h6)[class*='efm:'],
+  [class*='efm:'] :where(h1, h2, h3, h4, h5, h6) {
+    font-size: inherit;
+    font-weight: inherit;
+  }
+  [class*='efm:'] :where(svg, canvas, img, video) {
+    display: block;
+    vertical-align: middle;
+  }
+  :where(button, input, select, optgroup, textarea)[class*='efm:'],
+  [class*='efm:'] :where(button, input, select, optgroup, textarea) {
+    font: inherit;
+    /* MUST come after `font: inherit` — the shorthand resets `line-height` to
+       `inherit`, and with no root to style that resolves to `normal` for a
+       control whose ancestors are all unprefixed. See react-blender-nodes'
+       `src/index.css` for the full reasoning. */
+    line-height: 1.5;
+    color: inherit;
+    background-color: transparent;
+    border-radius: 0;
+    border: 0 solid;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+  :where(
+    button,
+    [type='button'],
+    [type='reset'],
+    [type='submit']
+  )[class*='efm:'],
+  [class*='efm:']
+    :where(button, [type='button'], [type='reset'], [type='submit']) {
+    -webkit-appearance: button;
+    appearance: button;
+    background-color: transparent;
+    background-image: none;
+  }
+}
+
+
+/* ── public tokens ──────────────────────────────────────────────────────────
+   The defaults are Nodestra's palette (the react-blender-nodes host's), so a
+   Nodestra migration is pixel-identical. Override any of them on `:root` or on
+   an ancestor of the components. */
+@layer theme {
+  :root,
+  :host {
+    --efm-font: inherit;
+    --efm-surface: #282828;
+    --efm-surface-raised: #303030;
+    --efm-surface-sunken: #1d1d1d;
+    --efm-border: #444444;
+    --efm-hover: #444444;
+    --efm-control: #545454;
+    --efm-fg: #e6e6e6;
+    --efm-fg-muted: #797979;
+    --efm-fg-disabled: #656565;
+    --efm-accent: #4772b3;
+    --efm-warning: #ffa500;
+    --efm-danger: #ff4444;
+    --efm-success: #4caf50;
+  }
+}
+
+/* `inline`: utilities reference the public variables directly
+   (`efm:bg-surface` → `background-color: var(--efm-surface)`), so overriding a
+   token restyles every component without rebuilding anything. */
+@theme inline {
+  --color-surface: var(--efm-surface);
+  --color-surface-raised: var(--efm-surface-raised);
+  --color-surface-sunken: var(--efm-surface-sunken);
+  --color-border: var(--efm-border);
+  --color-hover: var(--efm-hover);
+  --color-control: var(--efm-control);
+  --color-fg: var(--efm-fg);
+  --color-fg-muted: var(--efm-fg-muted);
+  --color-fg-disabled: var(--efm-fg-disabled);
+  --color-accent: var(--efm-accent);
+  --color-warning: var(--efm-warning);
+  --color-danger: var(--efm-danger);
+  --color-success: var(--efm-success);
+}

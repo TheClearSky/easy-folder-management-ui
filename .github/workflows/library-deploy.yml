@@ -1,0 +1,107 @@
+name: build & publish
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Single-checkout CI with no peers to fetch: `npm ci` resolves everything
+# from npm. A pull request runs the build job only; a push to `main` also
+# publishes (OIDC trusted publishing, no token).
+
+jobs:
+  build-library:
+    runs-on: ubuntu-22.04
+    permissions:
+      # No `id-token: write` here on purpose: this job never publishes, so it
+      # never needs the OIDC token.
+      contents: read
+    concurrency:
+      # Its own group (not shared with any other workflow in this repo), and a
+      # superseded PR build is cancelled rather than queued.
+      group: ci-build-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.x'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      # `tsc`, the Vite library build (core, ./react, ./ui + styles.css), then
+      # `scripts/check-dist.ts`: every manifest target exists and every ESM
+      # entry evaluates in plain Node (no DOM at import time).
+      - name: Build library
+        run: npm run build
+
+  deploy-library:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build-library
+    runs-on: ubuntu-22.04
+    environment:
+      name: npm
+    permissions:
+      contents: read
+      # Required by `npm publish --provenance`: npm exchanges this OIDC token
+      # with Sigstore to attest the build (trusted publishing — no token).
+      id-token: write
+    concurrency:
+      # A publish must never race another publish, and must never be cancelled
+      # half-way. Its own group so a queued deploy does not block builds.
+      group: deploy-npm-${{ github.ref }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.x'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build library
+        run: npm run build
+
+      # Every push to `main` reaches this job. Publishing an existing version
+      # is an error on the registry, so a doc-only push without a version bump
+      # must skip the publish rather than go red.
+      - name: Is this version already published?
+        id: published
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$NAME@$VERSION is already on the registry — nothing to publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "$NAME@$VERSION is new — publishing."
+          fi
+
+      # The package's trusted publisher (this repo / this workflow file /
+      # environment `npm`) is registered on npmjs.com and token publishing is
+      # disallowed there, so this step is the ONLY publish path. 0.0.1 was
+      # published by hand once to create the package — npm cannot register a
+      # trusted publisher for a name that does not exist yet.
+      - name: Publish to npm (OIDC trusted publishing)
+        if: steps.published.outputs.exists == 'false'
+        run: npm publish --provenance --access public
