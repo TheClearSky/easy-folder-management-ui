@@ -10,11 +10,14 @@ import {
 } from '@headless-tree/core';
 import type { DragTarget, ItemInstance, TreeInstance } from '@headless-tree/core';
 import * as ContextMenu from '@radix-ui/react-context-menu';
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+import type { FolderAccess } from '../core/backends';
 import type { LibrarySnapshot } from '../core/fileLibrary';
 import type { LibraryNode } from '../core/libraryTree';
 import { nameKey, splitExtension } from '../core/names';
 import type { FilePolicy } from '../core/policy';
 import { cn } from './cn';
+import { useFolderTheme } from './theme/FolderThemeContext';
 
 /**
  * The file library as a left sidebar: a headless-tree tree (MIT, zero
@@ -49,6 +52,17 @@ type FileSidebarStrings = {
   linkUnavailableTitle: string;
   folderTitle: string;
   readOnlyFolderTitle: string;
+  /** The access tag in folder mode. */
+  readOnlyTag: string;
+  readWriteTag: string;
+  accessMenuTitle: string;
+  readOnlyOption: string;
+  readOnlyOptionHint: string;
+  readWriteOption: string;
+  readWriteOptionHint: string;
+  /** Reconnect a read & write folder read-only instead. */
+  reconnectReadOnly: string;
+  reconnectReadOnlyTitle: string;
   unlink: string;
   unlinkTitle: string;
   reconnect: string;
@@ -88,6 +102,15 @@ const DEFAULT_STRINGS: FileSidebarStrings = {
     'Linking a local folder needs Chrome, Edge or Opera on desktop — Firefox and Safari do not provide the File System Access API.',
   folderTitle: 'Every change is written to this folder',
   readOnlyFolderTitle: 'This folder is linked read-only',
+  readOnlyTag: 'Read only',
+  readWriteTag: 'Read & write',
+  accessMenuTitle: 'Folder access — click to change',
+  readOnlyOption: 'Read only',
+  readOnlyOptionHint: 'Never change the folder',
+  readWriteOption: 'Read & write',
+  readWriteOptionHint: 'Create, rename, move, delete',
+  reconnectReadOnly: 'Read only',
+  reconnectReadOnlyTitle: 'Continue without write access (the browser asks only to read)',
   unlink: 'Unlink',
   unlinkTitle: 'Stop using the folder',
   reconnect: 'Reconnect',
@@ -144,7 +167,18 @@ type FileSidebarProps = {
   onUndoDelete?(): void;
   onLink?(): void;
   onUnlink?(): void;
-  onReconnect?(): void;
+  /** Reconnect with the folder's own access — or, from the "Read only"
+   *  button shown next to Reconnect when the folder is read & write and
+   *  `onChangeAccess` is given, with `'read'`. */
+  onReconnect?(access?: FolderAccess): void;
+  /** The linked folder's access, shown as a tag ("Read only" / "Read &
+   *  write"). Default: `snapshot.folderAccess`. */
+  access?: FolderAccess | null;
+  /** Makes the tag a menu to switch access. Call the switch straight from
+   *  this handler: an upgrade needs the click's user activation. */
+  onChangeAccess?(access: FolderAccess): void;
+  /** Show the access tag in folder mode (default true). */
+  showAccessTag?: boolean;
   onDismissError?(): void;
   onDismissNotice?(): void;
   /** Id of an item to put into rename mode right after it appears. */
@@ -161,12 +195,15 @@ type FileSidebarProps = {
   className?: string;
 };
 
-const ROW_HEIGHT = 'efm:h-[26px]';
+/** Larger on touch screens: 26 px rows are too small for a finger. */
+const ROW_HEIGHT = 'efm:h-[26px] efm:pointer-coarse:h-[40px] efm:pointer-coarse:text-[15px]';
 const INDENT_PX = 14;
 const TOOLBAR_BUTTON =
-  'efm:cursor-pointer efm:rounded efm:px-1.5 efm:py-0.5 efm:text-[12px] efm:text-fg efm:hover:bg-hover efm:disabled:cursor-default efm:disabled:opacity-40 efm:disabled:hover:bg-transparent';
+  'efm:cursor-pointer efm:rounded efm:px-1.5 efm:py-0.5 efm:text-[12px] efm:text-fg efm:hover:bg-hover efm:disabled:cursor-default efm:disabled:opacity-40 efm:disabled:hover:bg-transparent efm:pointer-coarse:px-3 efm:pointer-coarse:py-2 efm:pointer-coarse:text-[14px]';
 const MENU_ITEM =
-  'efm:flex efm:cursor-pointer efm:items-center efm:justify-between efm:gap-6 efm:rounded efm:px-2 efm:py-1 efm:text-[12px] efm:text-fg efm:outline-none efm:select-none efm:data-[disabled]:cursor-default efm:data-[disabled]:opacity-40 efm:data-[highlighted]:bg-hover';
+  'efm:flex efm:cursor-pointer efm:items-center efm:justify-between efm:gap-6 efm:rounded efm:px-2 efm:py-1 efm:text-[12px] efm:text-fg efm:outline-none efm:select-none efm:data-[disabled]:cursor-default efm:data-[disabled]:opacity-40 efm:data-[highlighted]:bg-hover efm:pointer-coarse:py-2.5 efm:pointer-coarse:text-[14px]';
+const ACCESS_TAG =
+  'efm:flex-none efm:rounded-full efm:border efm:px-1.5 efm:text-[10px] efm:leading-[16px] efm:font-semibold efm:tracking-wide efm:whitespace-nowrap efm:uppercase efm:pointer-coarse:px-2.5 efm:pointer-coarse:py-1 efm:pointer-coarse:text-[12px]';
 
 /**
  * Keys the TREE owns when a row has focus. Everything else — letters and
@@ -240,6 +277,12 @@ function FileSidebar(props: FileSidebarProps) {
   const canRenameAny = props.onRename !== undefined && !readOnly;
   const canDeleteAny = props.onDelete !== undefined && !readOnly;
   const canMoveAny = props.onMove !== undefined && !readOnly;
+  const theme = useFolderTheme();
+  const slots = theme?.fileSidebar;
+  const menu = theme?.menu;
+  const toolbarButton = cn(TOOLBAR_BUTTON, slots?.toolbarButton);
+  const contextMenuItem = cn(MENU_ITEM, menu?.item, slots?.contextMenuItem);
+  const menuHint = cn('efm:text-fg-muted', menu?.hint);
 
   const treeData = snapshot.tree;
   // The data loader is read lazily by the tree; refs keep it (and the
@@ -442,6 +485,71 @@ function FileSidebar(props: FileSidebarProps) {
   const hasMenu = openTarget !== null || renameTarget !== null || (canDeleteAny && selectedIds.length > 0) || appActions.length > 0;
 
   const mode = snapshot.mode;
+  const access = props.access === undefined ? snapshot.folderAccess : props.access;
+  const showAccessTag = props.showAccessTag !== false && access !== null && access !== undefined;
+  const accessLabel = access === 'readwrite' ? strings.readWriteTag : strings.readOnlyTag;
+  const accessTone =
+    access === 'readwrite' ? 'efm:border-accent efm:text-accent' : 'efm:border-fg-muted/60 efm:text-fg-muted';
+  const accessTagSlots = cn(
+    slots?.accessTag,
+    access === 'readwrite' ? slots?.accessTagReadWrite : slots?.accessTagReadOnly,
+  );
+  const accessTag = showAccessTag ? (
+    props.onChangeAccess ? (
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger
+          data-efm='access-tag'
+          className={cn(
+            ACCESS_TAG,
+            accessTone,
+            'efm:cursor-pointer efm:outline-none efm:hover:bg-hover efm:focus-visible:shadow-[0_0_0_1px_var(--efm-focus,var(--efm-accent))] efm:disabled:cursor-default efm:disabled:opacity-40',
+            accessTagSlots,
+          )}
+          disabled={folderActionsDisabled}
+          title={strings.accessMenuTitle}
+          aria-label={`${accessLabel} — ${strings.accessMenuTitle}`}
+        >
+          {accessLabel} ▾
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            align='end'
+            data-efm='access-menu'
+            className={cn(
+              'efm:z-1100 efm:min-w-[220px] efm:rounded-md efm:border efm:border-border efm:bg-surface-raised efm:p-1 efm:shadow-xl',
+              menu?.content,
+              slots?.accessMenu,
+            )}
+          >
+            <DropdownMenu.RadioGroup
+              value={access ?? 'read'}
+              onValueChange={(value) => {
+                if (value !== access) props.onChangeAccess?.(value as FolderAccess);
+              }}
+            >
+              {(['read', 'readwrite'] as const).map((option) => (
+                <DropdownMenu.RadioItem key={option} value={option} className={cn(MENU_ITEM, 'efm:justify-start efm:gap-2', menu?.item, slots?.accessMenuItem)}>
+                  <span aria-hidden='true' className={cn('efm:w-3 efm:text-accent', menu?.check)}>
+                    {access === option ? '✓' : ''}
+                  </span>
+                  <span className='efm:flex efm:flex-col'>
+                    <span>{option === 'read' ? strings.readOnlyOption : strings.readWriteOption}</span>
+                    <span className={cn('efm:text-[11px] efm:text-fg-muted efm:pointer-coarse:text-[13px]', menu?.hint)}>
+                      {option === 'read' ? strings.readOnlyOptionHint : strings.readWriteOptionHint}
+                    </span>
+                  </span>
+                </DropdownMenu.RadioItem>
+              ))}
+            </DropdownMenu.RadioGroup>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
+    ) : (
+      <span data-efm='access-tag' className={cn(ACCESS_TAG, accessTone, accessTagSlots)}>
+        {accessLabel}
+      </span>
+    )
+  ) : null;
   const visibleRootChildren = (treeData.children[treeData.rootId] ?? []).filter((id) => {
     const node = treeData.nodes[id];
     return node && !(props.hideInert && isInert(node));
@@ -455,6 +563,7 @@ function FileSidebar(props: FileSidebarProps) {
       data-efm='file-sidebar'
       className={cn(
         'efm:flex efm:h-full efm:w-[260px] efm:flex-none efm:flex-col efm:border-r efm:border-border efm:bg-surface efm:text-[13px] efm:text-fg',
+        slots?.root,
         props.className,
       )}
       aria-label={strings.title}
@@ -475,14 +584,19 @@ function FileSidebar(props: FileSidebarProps) {
         }
       }}
     >
-      <div className='efm:flex efm:items-center efm:gap-1 efm:border-b efm:border-border efm:px-2 efm:py-1.5'>
-        <span className='efm:mr-auto efm:text-[12px] efm:font-semibold efm:tracking-wide efm:text-fg-muted efm:uppercase'>
+      <div className={cn('efm:flex efm:items-center efm:gap-1 efm:border-b efm:border-border efm:px-2 efm:py-1.5', slots?.header)}>
+        <span
+          className={cn(
+            'efm:mr-auto efm:text-[12px] efm:font-semibold efm:tracking-wide efm:text-fg-muted efm:uppercase',
+            slots?.title,
+          )}
+        >
           {strings.title}
         </span>
         {showToolbar && props.onNewFile && (
           <button
             type='button'
-            className={TOOLBAR_BUTTON}
+            className={toolbarButton}
             disabled={readOnly}
             title={strings.newFileTitle}
             aria-label={strings.newFileTitle}
@@ -494,7 +608,7 @@ function FileSidebar(props: FileSidebarProps) {
         {showToolbar && props.onNewFolder && (
           <button
             type='button'
-            className={TOOLBAR_BUTTON}
+            className={toolbarButton}
             disabled={readOnly}
             title={strings.newFolderTitle}
             aria-label={strings.newFolderTitle}
@@ -505,18 +619,23 @@ function FileSidebar(props: FileSidebarProps) {
         )}
       </div>
 
-      <div className='efm:flex efm:items-center efm:gap-1 efm:border-b efm:border-border efm:px-2 efm:py-1 efm:text-[12px] efm:text-fg-muted'>
-        {mode.kind === 'loading' && <span>{strings.loading}</span>}
+      <div
+        className={cn(
+          'efm:flex efm:items-center efm:gap-1 efm:border-b efm:border-border efm:px-2 efm:py-1 efm:text-[12px] efm:text-fg-muted',
+          slots?.modeRow,
+        )}
+      >
+        {mode.kind === 'loading' && <span className={slots?.modeLabel}>{strings.loading}</span>}
         {mode.kind === 'memory' && (
           <>
-            <span className='efm:mr-auto' title={strings.inBrowserTitle}>
+            <span className={cn('efm:mr-auto', slots?.modeLabel)} title={strings.inBrowserTitle}>
               {snapshot.storageUnavailable ? strings.tabOnly : strings.inBrowser}
             </span>
             {props.onLink &&
               (canLinkFolders ? (
                 <button
                   type='button'
-                  className={TOOLBAR_BUTTON}
+                  className={toolbarButton}
                   disabled={folderActionsDisabled}
                   onClick={props.onLink}
                   title={strings.linkFolderTitle}
@@ -524,7 +643,7 @@ function FileSidebar(props: FileSidebarProps) {
                   {strings.linkFolder}
                 </button>
               ) : (
-                <span className='efm:text-[11px]' title={strings.linkUnavailableTitle}>
+                <span className={cn('efm:text-[11px]', slots?.modeLabel)} title={strings.linkUnavailableTitle}>
                   {strings.linkUnavailable}
                 </span>
               ))}
@@ -533,15 +652,16 @@ function FileSidebar(props: FileSidebarProps) {
         {mode.kind === 'folder' && (
           <>
             <span
-              className='efm:mr-auto efm:truncate'
-              title={readOnly ? strings.readOnlyFolderTitle : strings.folderTitle}
+              className={cn('efm:mr-auto efm:min-w-0 efm:truncate', slots?.modeLabel)}
+              title={access === 'read' || readOnly ? strings.readOnlyFolderTitle : strings.folderTitle}
             >
               📁 {mode.folderName}
             </span>
+            {accessTag}
             {props.onUnlink && (
               <button
                 type='button'
-                className={TOOLBAR_BUTTON}
+                className={toolbarButton}
                 disabled={folderActionsDisabled}
                 onClick={props.onUnlink}
                 title={strings.unlinkTitle}
@@ -553,22 +673,37 @@ function FileSidebar(props: FileSidebarProps) {
         )}
         {mode.kind === 'reconnect' && (
           <>
-            <span className='efm:mr-auto efm:truncate'>📁 {mode.folderName}</span>
+            <span className={cn('efm:mr-auto efm:min-w-0 efm:truncate', slots?.modeLabel)}>📁 {mode.folderName}</span>
             {props.onReconnect && (
               <button
                 type='button'
-                className={cn(TOOLBAR_BUTTON, 'efm:text-warning')}
+                className={cn(TOOLBAR_BUTTON, 'efm:text-warning', slots?.toolbarButton, slots?.reconnectButton)}
                 disabled={folderActionsDisabled}
-                onClick={props.onReconnect}
-                title={strings.reconnectTitle}
+                onClick={() => props.onReconnect?.()}
+                title={
+                  access && showAccessTag
+                    ? `${strings.reconnectTitle} (${access === 'readwrite' ? strings.readWriteTag : strings.readOnlyTag})`
+                    : strings.reconnectTitle
+                }
               >
                 {strings.reconnect}
+              </button>
+            )}
+            {props.onReconnect && props.onChangeAccess && showAccessTag && access === 'readwrite' && (
+              <button
+                type='button'
+                className={toolbarButton}
+                disabled={folderActionsDisabled}
+                onClick={() => props.onReconnect?.('read')}
+                title={strings.reconnectReadOnlyTitle}
+              >
+                {strings.reconnectReadOnly}
               </button>
             )}
             {props.onUnlink && (
               <button
                 type='button'
-                className={TOOLBAR_BUTTON}
+                className={toolbarButton}
                 disabled={folderActionsDisabled}
                 onClick={props.onUnlink}
                 title={strings.forgetTitle}
@@ -581,11 +716,11 @@ function FileSidebar(props: FileSidebarProps) {
       </div>
 
       {showSelectionBar && (
-        <div className='efm:flex efm:items-center efm:gap-1 efm:border-b efm:border-border efm:px-2 efm:py-1'>
+        <div className={cn('efm:flex efm:items-center efm:gap-1 efm:border-b efm:border-border efm:px-2 efm:py-1', slots?.selectionBar)}>
           {props.onRename && (
             <button
               type='button'
-              className={TOOLBAR_BUTTON}
+              className={toolbarButton}
               disabled={renameTarget === null}
               onClick={() => renameTarget && tree.getItemInstance(renameTarget).startRenaming()}
               title={strings.renameTitle}
@@ -596,7 +731,7 @@ function FileSidebar(props: FileSidebarProps) {
           {props.onDelete && (
             <button
               type='button'
-              className={TOOLBAR_BUTTON}
+              className={toolbarButton}
               disabled={!canDeleteAny || selectedIds.length === 0}
               onClick={() => props.onDelete?.(selectedIds)}
               title={strings.deleteTitle}
@@ -607,7 +742,7 @@ function FileSidebar(props: FileSidebarProps) {
           {snapshot.undoableDelete && props.onUndoDelete && (
             <button
               type='button'
-              className={cn(TOOLBAR_BUTTON, 'efm:ml-auto')}
+              className={cn(TOOLBAR_BUTTON, 'efm:ml-auto', slots?.toolbarButton)}
               disabled={readOnly}
               onClick={props.onUndoDelete}
               title={`Restore ${snapshot.undoableDelete}`}
@@ -616,7 +751,7 @@ function FileSidebar(props: FileSidebarProps) {
             </button>
           )}
           {snapshot.busy && (
-            <span className='efm:ml-auto efm:text-[11px] efm:text-fg-muted'>{strings.saving}</span>
+            <span className={cn('efm:ml-auto efm:text-[11px] efm:text-fg-muted', slots?.savingLabel)}>{strings.saving}</span>
           )}
         </div>
       )}
@@ -625,7 +760,7 @@ function FileSidebar(props: FileSidebarProps) {
         <ContextMenu.Trigger asChild disabled={!hasMenu}>
           <div
             {...tree.getContainerProps(strings.title)}
-            className='efm:relative efm:min-h-0 efm:flex-1 efm:overflow-y-auto efm:py-1 efm:outline-none'
+            className={cn('efm:relative efm:min-h-0 efm:flex-1 efm:overflow-y-auto efm:py-1 efm:outline-none', slots?.tree)}
           >
             {tree.getItems().map((item) => {
               // Skip stale rows (a placeholder from the loader) until the rebuild.
@@ -637,6 +772,9 @@ function FileSidebar(props: FileSidebarProps) {
               const level = item.getItemMeta().level;
               const renameProps = item.isRenaming() ? item.getRenameInputProps() : null;
               const rowProps = item.getProps();
+              const selected = item.isSelected();
+              const focused = item.isFocused();
+              const dropTarget = item.isDragTarget() && node.kind === 'folder';
               return (
                 <div
                   key={item.getKey()}
@@ -666,19 +804,25 @@ function FileSidebar(props: FileSidebarProps) {
                   className={cn(
                     'efm:flex efm:cursor-pointer efm:items-center efm:gap-1.5 efm:pr-2 efm:outline-none efm:select-none',
                     ROW_HEIGHT,
-                    item.isSelected() && 'efm:bg-hover',
-                    isActive && 'efm:bg-accent/25',
-                    item.isFocused() && 'efm:shadow-[inset_0_0_0_1px_var(--efm-fg-disabled)]',
-                    item.isDragTarget() && node.kind === 'folder' && 'efm:bg-accent/40',
+                    selected && 'efm:bg-hover',
+                    isActive && 'efm:bg-[color:var(--efm-selection,color-mix(in_oklab,var(--efm-accent)_25%,transparent))]',
+                    focused && 'efm:shadow-[inset_0_0_0_1px_var(--efm-focus,var(--efm-fg-disabled))]',
+                    dropTarget && 'efm:bg-accent/40',
                     inert && 'efm:cursor-default efm:text-fg-disabled efm:opacity-60',
+                    slots?.row,
+                    selected && slots?.rowSelected,
+                    isActive && slots?.rowActive,
+                    focused && slots?.rowFocused,
+                    dropTarget && slots?.rowDropTarget,
+                    inert && slots?.rowInert,
                   )}
                   style={{ paddingLeft: 8 + level * INDENT_PX }}
                   title={inert ? strings.inert : unsupported ? strings.unsupported : undefined}
                 >
-                  <span aria-hidden='true' className='efm:w-3 efm:text-center efm:text-[10px] efm:text-fg-muted'>
+                  <span aria-hidden='true' className={cn('efm:w-3 efm:text-center efm:text-[10px] efm:text-fg-muted', slots?.rowChevron)}>
                     {node.kind === 'folder' ? (item.isExpanded() ? '▾' : '▸') : ''}
                   </span>
-                  <span aria-hidden='true' className='efm:flex efm:w-4 efm:justify-center efm:text-[12px]'>
+                  <span aria-hidden='true' className={cn('efm:flex efm:w-4 efm:justify-center efm:text-[12px]', slots?.rowIcon)}>
                     {props.renderIcon
                       ? props.renderIcon(node, { expanded: item.isExpanded(), inert })
                       : node.kind === 'folder'
@@ -718,13 +862,17 @@ function FileSidebar(props: FileSidebarProps) {
                         if (renaming) commitRename(renaming, value);
                       }}
                       aria-label={`${strings.rename} ${node.name}`}
-                      className='efm:min-w-0 efm:flex-1 efm:rounded efm:border efm:border-accent efm:bg-surface-sunken efm:px-1 efm:text-[13px] efm:text-fg efm:outline-none'
+                      className={cn(
+                        'efm:min-w-0 efm:flex-1 efm:rounded efm:border efm:border-accent efm:bg-surface-sunken efm:px-1 efm:text-[13px] efm:text-fg efm:outline-none',
+                        slots?.rowRenameInput,
+                      )}
                     />
                   ) : (
                     <span
                       className={cn(
                         'efm:min-w-0 efm:flex-1 efm:truncate',
                         unsupported && 'efm:line-through efm:decoration-fg-disabled',
+                        slots?.rowLabel,
                       )}
                     >
                       {node.name}
@@ -735,56 +883,60 @@ function FileSidebar(props: FileSidebarProps) {
                     <span
                       aria-label={strings.unsaved}
                       title={strings.unsaved}
-                      className='efm:h-2 efm:w-2 efm:flex-none efm:rounded-full efm:bg-warning'
+                      className={cn('efm:h-2 efm:w-2 efm:flex-none efm:rounded-full efm:bg-warning', slots?.dirtyDot)}
                     />
                   )}
                 </div>
               );
             })}
             {empty && mode.kind !== 'loading' && (
-              <p className='efm:px-3 efm:py-4 efm:text-[12px] efm:leading-relaxed efm:text-fg-muted'>
+              <p className={cn('efm:px-3 efm:py-4 efm:text-[12px] efm:leading-relaxed efm:text-fg-muted', slots?.empty)}>
                 {mode.kind === 'reconnect' ? strings.emptyReconnect : strings.empty}
               </p>
             )}
-            <div style={tree.getDragLineStyle()} className='efm:pointer-events-none efm:h-0.5 efm:bg-accent' />
+            <div style={tree.getDragLineStyle()} className={cn('efm:pointer-events-none efm:h-0.5 efm:bg-accent', slots?.dropLine)} />
           </div>
         </ContextMenu.Trigger>
         <ContextMenu.Portal>
           <ContextMenu.Content
             data-efm='file-menu'
-            className='efm:z-1100 efm:min-w-[200px] efm:rounded-md efm:border efm:border-border efm:bg-surface-raised efm:p-1 efm:shadow-xl'
+            className={cn(
+              'efm:z-1100 efm:min-w-[200px] efm:rounded-md efm:border efm:border-border efm:bg-surface-raised efm:p-1 efm:shadow-xl',
+              menu?.content,
+              slots?.contextMenu,
+            )}
           >
             {openTarget !== null && (
-              <ContextMenu.Item className={MENU_ITEM} onSelect={() => onOpen(openTarget, { preview: false })}>
+              <ContextMenu.Item className={contextMenuItem} onSelect={() => onOpen(openTarget, { preview: false })}>
                 {strings.open}
               </ContextMenu.Item>
             )}
             {renameTarget !== null && (
               <ContextMenu.Item
-                className={MENU_ITEM}
+                className={contextMenuItem}
                 onSelect={() => tree.getItemInstance(renameTarget).startRenaming()}
               >
-                {strings.rename} <span className='efm:text-fg-muted'>F2</span>
+                {strings.rename} <span className={menuHint}>F2</span>
               </ContextMenu.Item>
             )}
             {canDeleteAny && selectedIds.length > 0 && (
-              <ContextMenu.Item className={MENU_ITEM} onSelect={() => props.onDelete?.(selectedIds)}>
+              <ContextMenu.Item className={contextMenuItem} onSelect={() => props.onDelete?.(selectedIds)}>
                 {selectedIds.length > 1 ? strings.deleteMany(selectedIds.length) : strings.delete}{' '}
-                <span className='efm:text-fg-muted'>Del</span>
+                <span className={menuHint}>Del</span>
               </ContextMenu.Item>
             )}
             {appActions.length > 0 && (openTarget !== null || renameTarget !== null || canDeleteAny) && (
-              <ContextMenu.Separator className='efm:my-1 efm:h-px efm:bg-border' />
+              <ContextMenu.Separator className={cn('efm:my-1 efm:h-px efm:bg-border', menu?.separator)} />
             )}
             {appActions.map((action) => (
               <ContextMenu.Item
                 key={action.id}
-                className={MENU_ITEM}
+                className={contextMenuItem}
                 disabled={action.disabled}
                 onSelect={action.onSelect}
               >
                 {action.label}
-                {action.shortcut && <span className='efm:text-fg-muted'>{action.shortcut}</span>}
+                {action.shortcut && <span className={menuHint}>{action.shortcut}</span>}
               </ContextMenu.Item>
             ))}
           </ContextMenu.Content>
@@ -794,11 +946,14 @@ function FileSidebar(props: FileSidebarProps) {
       {snapshot.notice && (
         <div
           role='status'
-          className='efm:flex efm:items-start efm:gap-2 efm:border-t efm:border-warning/50 efm:bg-warning/10 efm:px-2 efm:py-1.5 efm:text-[12px]'
+          className={cn(
+            'efm:flex efm:items-start efm:gap-2 efm:border-t efm:border-warning/50 efm:bg-warning/10 efm:px-2 efm:py-1.5 efm:text-[12px]',
+            slots?.notice,
+          )}
         >
           <span className='efm:min-w-0 efm:flex-1'>{snapshot.notice}</span>
           {props.onDismissNotice && (
-            <button type='button' className={TOOLBAR_BUTTON} onClick={props.onDismissNotice} aria-label={strings.dismiss}>
+            <button type='button' className={toolbarButton} onClick={props.onDismissNotice} aria-label={strings.dismiss}>
               ✕
             </button>
           )}
@@ -807,11 +962,14 @@ function FileSidebar(props: FileSidebarProps) {
       {snapshot.error && (
         <div
           role='alert'
-          className='efm:flex efm:items-start efm:gap-2 efm:border-t efm:border-danger/60 efm:bg-danger/15 efm:px-2 efm:py-1.5 efm:text-[12px]'
+          className={cn(
+            'efm:flex efm:items-start efm:gap-2 efm:border-t efm:border-danger/60 efm:bg-danger/15 efm:px-2 efm:py-1.5 efm:text-[12px]',
+            slots?.error,
+          )}
         >
           <span className='efm:min-w-0 efm:flex-1'>{snapshot.error}</span>
           {props.onDismissError && (
-            <button type='button' className={TOOLBAR_BUTTON} onClick={props.onDismissError} aria-label={strings.dismiss}>
+            <button type='button' className={toolbarButton} onClick={props.onDismissError} aria-label={strings.dismiss}>
               ✕
             </button>
           )}

@@ -13,6 +13,10 @@
  */
 
 interface KeyValueStore {
+  /** The database name of a PERSISTENT store (`createIndexedDbStore`); absent
+   *  for a store that lives in memory. The library names its OPFS directory
+   *  after it (`<name>.blobs`). */
+  readonly name?: string;
   get<T = unknown>(key: string): Promise<T | undefined>;
   set(key: string, value: unknown): Promise<void>;
   delete(key: string): Promise<void>;
@@ -70,6 +74,7 @@ function createIndexedDbStore(databaseName: string): KeyValueStore {
     return result;
   };
   return {
+    name: databaseName,
     get: <T,>(key: string) => run('readonly', (store) => store.get(key)) as Promise<T | undefined>,
     set: async (key, value) => {
       await run('readwrite', (store) => store.put(value, key));

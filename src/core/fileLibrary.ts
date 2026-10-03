@@ -26,6 +26,15 @@ import {
   scanFolder,
 } from './backends';
 import type { FolderAccess, LibraryBackend, WriteData, WriteOptions } from './backends';
+import {
+  canUseOpfs,
+  createOpfsBlobStore,
+  estimateStorage,
+  requestPersistentStorage,
+  withBlobLock,
+} from './blobStore';
+import type { BlobStore, StorageInfo } from './blobStore';
+import { formatBytes } from './format';
 import { createMemoryStore } from './keyValueStore';
 import type { KeyValueStore } from './keyValueStore';
 import {
@@ -71,6 +80,69 @@ type LibrarySnapshot = {
   undoableDelete: string | null;
   /** The browser refused its storage; the library lives for this tab only. */
   storageUnavailable: boolean;
+  /** What the linked folder may do — `'read'` (every change refused) or
+   *  `'readwrite'`. In `reconnect` mode: the access Reconnect will ask for.
+   *  `null` without a folder. Persisted next to the folder handle. */
+  folderAccess: FolderAccess | null;
+  /** An UNLINK that keeps a copy is copying; `null` otherwise. */
+  unlinkProgress: UnlinkProgress | null;
+};
+
+/** What UNLINK would do, for the dialog that offers KEEP or REMOVE. */
+type UnlinkPlan = {
+  /** `'folder'`: a readable linked folder — KEEP can copy it. `'forget'`: a
+   *  folder awaiting reconnection — nothing is readable, so the library just
+   *  forgets it (REMOVE). */
+  mode: 'folder' | 'forget';
+  folderName: string;
+  /** Everything in the tree, as listed. */
+  folders: number;
+  openable: number;
+  otherFiles: number;
+  /** What KEEP copies into the browser: every folder, the files the policy's
+   *  `copyOnUnlink` allows, and their total size in bytes. */
+  keep: {
+    folders: number;
+    files: number;
+    bytes: number;
+    /** Files the policy leaves on disk only. */
+    leftOnDisk: number;
+    /** Files whose size could not be read (they will be skipped). */
+    unreadable: number;
+  };
+  /** This site's storage, when the browser says (`navigator.storage.estimate()`). */
+  storage: StorageInfo | null;
+  /** Does KEEP fit in the free space? `null` when the browser does not say. */
+  fits: boolean | null;
+};
+
+type UnlinkProgress = {
+  bytesCopied: number;
+  bytesTotal: number;
+  filesCopied: number;
+  filesTotal: number;
+  /** The file being copied, or `null` between files and while finishing. */
+  currentFile: string | null;
+};
+
+type UnlinkOptions = {
+  /** `true`: copy the folder into the browser (KEEP). `false`: the
+   *  in-browser library ends up empty (REMOVE). Nothing on disk is touched
+   *  either way. */
+  keep: boolean;
+  /** Cancels a KEEP copy; the folder stays linked and nothing is copied. */
+  signal?: AbortSignal;
+  /** Throttled (about ten times a second, plus the first and last). */
+  onProgress?(progress: UnlinkProgress): void;
+};
+
+type UnlinkResult = {
+  /** Files copied into the browser. */
+  kept: number;
+  /** Files that could not be read and were not copied. */
+  skipped: number;
+  /** Bytes copied. */
+  bytes: number;
 };
 
 /** What a delete removed, enough to put it back (kept files and folders). */
@@ -80,7 +152,10 @@ type DeletedSubtree = {
 };
 
 const FOLDER_HANDLE_KEY = 'folderHandle';
+const FOLDER_ACCESS_KEY = 'folderAccess';
 const INITIALIZED_KEY = 'initialized';
+/** Unlink progress reaches subscribers at most this often. */
+const PROGRESS_INTERVAL_MS = 100;
 
 /** Re-scans triggered by window focus are cheap only when rare. */
 const MIN_RESCAN_INTERVAL_MS = 2000;
@@ -89,10 +164,25 @@ type FileLibraryOptions = {
   store: KeyValueStore;
   /** Which files the app opens and how their contents may be handled. */
   policy: FilePolicy;
-  /** What a linked folder may do. `'read'` asks the browser for read access
-   *  only and refuses every change (create, rename, move, delete, write).
-   *  Default `'readwrite'`. */
+  /** What a NEWLY linked folder may do, unless `link()` says otherwise.
+   *  `'read'` asks the browser for read access only and refuses every change
+   *  (create, rename, move, delete, write). Default `'readwrite'`. A linked
+   *  folder's own access is persisted and wins after a reload. */
   access?: FolderAccess;
+  /**
+   * Where the in-browser library keeps BINARY contents (text is always a
+   * string in `store`, the format Nodestra's libraries hold).
+   *  - `'auto'` (default): a `'binary'` policy over a PERSISTENT store
+   *    (`createIndexedDbStore(name)`) uses the Origin Private File System,
+   *    directory `<name>.blobs`, when the browser has it — files are streamed
+   *    there, never read into memory, and `getFile()` returns disk-backed
+   *    Files. Otherwise (a text policy, `createMemoryStore`, no OPFS) binary
+   *    contents are Blobs in `store`, as before.
+   *  - a `BlobStore` (`createOpfsBlobStore(dir)`, `createMemoryBlobStore()`):
+   *    use that one.
+   *  - `null`: never a blob store.
+   */
+  blobStore?: BlobStore | 'auto' | null;
   /** Flush pending edits of any of these files before they move or vanish.
    *  Called OUTSIDE the queue. */
   beforeMutate?: (affectedIds: readonly string[]) => Promise<void>;
@@ -108,6 +198,8 @@ class FileLibrary {
     busy: false,
     undoableDelete: null,
     storageUnavailable: false,
+    folderAccess: null,
+    unlinkProgress: null,
   };
   private readonly listeners = new Set<() => void>();
   private store: KeyValueStore;
@@ -123,22 +215,39 @@ class FileLibrary {
   private storedHandle: FileSystemDirectoryHandle | null = null;
   private lastRescanAt = 0;
   private rescanning = false;
+  private unlinkController: AbortController | null = null;
+  private readonly explicitBlobStore: boolean;
   beforeMutate: (affectedIds: readonly string[]) => Promise<void>;
   readonly policy: FilePolicy;
-  /** What the linked folder may do now. Starts as the `access` option; a
-   *  read-only link can be upgraded with `requestWriteAccess()`. */
+  /** What the linked folder may do now (or, without one, what the next link
+   *  gets by default). Change it with `setAccess()`. */
   get access(): FolderAccess {
     return this.accessState;
   }
   private accessState: FolderAccess;
+  private readonly defaultAccess: FolderAccess;
 
   constructor(options: FileLibraryOptions) {
     this.store = options.store;
     this.policy = options.policy;
-    this.accessState = options.access ?? 'readwrite';
-    this.memory = new MemoryBackend(this.store);
+    this.defaultAccess = options.access ?? 'readwrite';
+    this.accessState = this.defaultAccess;
+    const option = options.blobStore === undefined ? 'auto' : options.blobStore;
+    this.explicitBlobStore = option !== 'auto' && option !== null;
+    const blobs =
+      option === 'auto'
+        ? this.policy.content === 'binary' && this.store.name && canUseOpfs()
+          ? createOpfsBlobStore(`${this.store.name}.blobs`)
+          : null
+        : option;
+    this.memory = new MemoryBackend(this.store, blobs);
     this.backend = this.memory;
     this.beforeMutate = options.beforeMutate ?? (async () => {});
+  }
+
+  /** The store binary contents of the in-browser library go to, if any. */
+  get blobStore(): BlobStore | null {
+    return this.memory.blobs;
   }
 
   // ── store plumbing ────────────────────────────────────────────────────
@@ -195,7 +304,8 @@ class FileLibrary {
         if (this.pendingWrites === 0) this.set({ busy: false });
       });
     return result.catch((error: unknown) => {
-      if (!(error instanceof ConflictError)) {
+      // A conflict has its own UI; a cancel is the user's own choice.
+      if (!(error instanceof ConflictError) && !isAbort(error)) {
         this.set({ error: describe(error) });
         this.noticeAccessLoss(error);
       }
@@ -249,32 +359,68 @@ class FileLibrary {
       await this.store.keys();
     } catch {
       this.store = createMemoryStore();
-      this.memory = new MemoryBackend(this.store);
+      this.memory = new MemoryBackend(this.store, this.explicitBlobStore ? this.memory.blobs : null);
       this.backend = this.memory;
       this.set({ storageUnavailable: true });
+    }
+    // The same probe for the automatic OPFS store (refused in some private
+    // modes): without it, binary contents go into the key-value store.
+    if (this.memory.blobs && !this.explicitBlobStore) {
+      const usable = await this.memory.blobs.keys().then(
+        () => true,
+        () => false,
+      );
+      if (!usable) {
+        this.memory = new MemoryBackend(this.store, null);
+        this.backend = this.memory;
+      }
     }
     const handle = await this.store
       .get<FileSystemDirectoryHandle>(FOLDER_HANDLE_KEY)
       .catch(() => undefined);
     if (handle && canLinkFolders()) {
       this.storedHandle = handle;
-      const permission = await folderPermission(handle, false, this.access).catch(
+      // The access the user chose for THIS folder (0.0.4+); older stores
+      // have none and get the `access` option.
+      const stored = await this.store.get<unknown>(FOLDER_ACCESS_KEY).catch(() => undefined);
+      const access: FolderAccess =
+        stored === 'read' || stored === 'readwrite' ? stored : this.defaultAccess;
+      this.accessState = access;
+      // The in-browser store is empty while a folder is linked (LINK
+      // discards it): anything in the blob store is left over.
+      await this.memory.sweep(new Set()).catch(() => 0);
+      const permission = await folderPermission(handle, false, access).catch(
         () => 'denied' as PermissionState,
       );
       if (permission === 'granted') {
         try {
-          await this.attachFolder(handle);
+          await this.attachFolder(handle, access);
           return;
         } catch {
           // Moved or deleted outside the app: fall through to "reconnect".
         }
       }
+      // Not granted (Chrome forgets grants between visits unless the user
+      // allowed "on every visit"): Reconnect asks for `access` again, or the
+      // app offers `reconnect({ access: 'read' })` instead.
       this.backend = this.folderBackend(handle);
-      this.set({ mode: { kind: 'reconnect', folderName: handle.name } });
+      this.set({ mode: { kind: 'reconnect', folderName: handle.name }, folderAccess: access });
       return;
     }
     const stored = await this.memory.loadStructure().catch(() => undefined);
-    const tree = (stored && deserializeTree(stored)) || createEmptyTree();
+    const parsed = stored ? deserializeTree(stored) : undefined;
+    const tree = parsed || createEmptyTree();
+    // Blob-store entries no file refers to (a copy cut short by a closed
+    // tab). Never when a stored structure failed to parse: its files might
+    // still be recoverable.
+    if (stored === undefined || parsed) {
+      const referenced = new Set(
+        Object.values(tree.nodes)
+          .filter((node) => node.kind === 'file')
+          .map((node) => node.id),
+      );
+      await this.memory.sweep(referenced).catch(() => 0);
+    }
     this.backend = this.memory;
     this.set({ mode: { kind: 'memory' }, tree });
   }
@@ -289,13 +435,15 @@ class FileLibrary {
     await this.store.set(INITIALIZED_KEY, true).catch(() => {});
   }
 
-  private async attachFolder(handle: FileSystemDirectoryHandle): Promise<void> {
+  private async attachFolder(handle: FileSystemDirectoryHandle, access: FolderAccess): Promise<void> {
     const { tree, unreadable } = await scanFolder(handle, undefined, this.scanOptions);
     this.backend = this.folderBackend(handle);
     this.storedHandle = handle;
+    this.accessState = access;
     this.lastRescanAt = Date.now();
     this.set({
       mode: { kind: 'folder', folderName: handle.name },
+      folderAccess: access,
       tree,
       unsupported: new Set(),
       notice:
@@ -309,45 +457,86 @@ class FileLibrary {
    * Re-grant access to the stored folder. MUST be called from a click, and
    * asks for permission FIRST — before any queue hop or storage read, which
    * would outlive the click's user activation.
+   *
+   * `access` defaults to the folder's own (persisted) access. Passing
+   * `'read'` for a read-write folder whose write permission is gone after a
+   * reload continues READ-ONLY instead (and remembers that choice).
    */
-  reconnect(): Promise<void> {
+  reconnect(options: { access?: FolderAccess } = {}): Promise<void> {
     const handle = this.storedHandle;
     if (!handle) return Promise.reject(new LibraryError('No folder is linked.'));
-    const permission = folderPermission(handle, true, this.access);
+    const access = options.access ?? this.accessState;
+    const permission = folderPermission(handle, true, access); // FIRST (FB-28)
     return this.run(async () => {
       if ((await permission) !== 'granted') {
-        throw new LibraryError('The browser did not grant access to the folder.');
+        throw new LibraryError(
+          access === 'readwrite'
+            ? 'The browser did not grant write access to the folder. You can continue read-only.'
+            : 'The browser did not grant access to the folder.',
+        );
       }
-      await this.attachFolder(handle);
+      if (access !== this.accessState || options.access !== undefined) {
+        await this.store.set(FOLDER_ACCESS_KEY, access).catch(() => {});
+      }
+      await this.attachFolder(handle, access);
     }, { write: false });
   }
 
   /**
-   * Upgrade a READ-ONLY link to read-write for the rest of the session — for
-   * an app that only sometimes writes (watch-together saves a downloaded
-   * copy). Same rule as `reconnect`: call it straight from a click; the
-   * permission is requested FIRST, before anything that could outlive the
-   * click's user activation. Resolves `true` when writing is now allowed.
-   * After a reload the library starts from its `access` option again (the
-   * browser may still remember the grant, so a later request is often
-   * silent).
+   * Switch the linked folder between read-only and read & write; the choice
+   * is persisted next to the folder handle. Resolves `true` when the folder
+   * now has `access`.
+   *
+   *  - UPGRADE (`'readwrite'`) needs the browser's permission: call it
+   *    straight from a click — the request is the FIRST thing that happens.
+   *    A refusal keeps the folder read-only and says so in `notice`.
+   *  - DOWNGRADE (`'read'`) waits for every queued write (a save in flight)
+   *    to finish, then refuses writes. The browser keeps its grant (there is
+   *    no API to give it back); the library simply stops writing.
+   *
+   * The in-browser store is always writable: `'readwrite'` resolves `true`,
+   * `'read'` resolves `false`. While a folder awaits reconnection, use
+   * `reconnect({ access })` instead (this resolves `false`).
+   */
+  setAccess(access: FolderAccess): Promise<boolean> {
+    const kind = this.snapshot.mode.kind;
+    if (kind === 'memory') return Promise.resolve(access === 'readwrite');
+    const handle = this.storedHandle;
+    if (kind !== 'folder' || !handle) return Promise.resolve(false);
+    if (access === this.accessState) return Promise.resolve(true);
+    if (access === 'readwrite') {
+      const permission = folderPermission(handle, true, 'readwrite'); // FIRST
+      const refused = () => {
+        this.set({ notice: 'The browser did not allow writing to the folder, so it stays read-only.' });
+        return false;
+      };
+      return permission.then(async (state) => {
+        if (state !== 'granted') return refused();
+        // Unlinked or re-linked while the prompt was open: nothing to upgrade.
+        if (this.snapshot.mode.kind !== 'folder' || this.storedHandle !== handle) return false;
+        this.accessState = 'readwrite';
+        await this.store.set(FOLDER_ACCESS_KEY, 'readwrite').catch(() => {});
+        this.set({ folderAccess: 'readwrite' });
+        return true;
+      }, refused);
+    }
+    // Behind everything already queued: a save issued before the switch
+    // still lands; writes issued after it are refused.
+    return this.run(async () => {
+      if (this.storedHandle !== handle) return false;
+      this.accessState = 'read';
+      await this.store.set(FOLDER_ACCESS_KEY, 'read').catch(() => {});
+      this.set({ folderAccess: 'read' });
+      return true;
+    }, { write: false });
+  }
+
+  /**
+   * `setAccess('readwrite')` — kept from 0.0.1. Since 0.0.4 the upgrade is
+   * PERSISTED for this folder (it used to last for the session only).
    */
   requestWriteAccess(): Promise<boolean> {
-    if (this.accessState === 'readwrite' || this.snapshot.mode.kind === 'memory') {
-      return Promise.resolve(this.writable);
-    }
-    const handle = this.storedHandle;
-    if (!handle || this.snapshot.mode.kind !== 'folder') return Promise.resolve(false);
-    const permission = folderPermission(handle, true, 'readwrite');
-    return permission.then(
-      (state) => {
-        if (state !== 'granted') return false;
-        this.accessState = 'readwrite';
-        this.set({}); // `writable` changed: tell subscribers
-        return true;
-      },
-      () => false,
-    );
+    return this.setAccess('readwrite');
   }
 
   /**
@@ -383,86 +572,262 @@ class FileLibrary {
    * persisted before the mode switches, so a failure part-way cannot leave
    * a linked-looking library that forgets its folder on reload.
    */
-  link(handle: FileSystemDirectoryHandle): Promise<void> {
+  link(handle: FileSystemDirectoryHandle, options: { access?: FolderAccess } = {}): Promise<void> {
+    const access = options.access ?? this.defaultAccess;
     return this.run(async () => {
       // The picker already granted access; query first so no second prompt
       // appears, and request only if the picker did not.
-      let permission = await folderPermission(handle, false, this.access);
-      if (permission !== 'granted') permission = await folderPermission(handle, true, this.access);
+      let permission = await folderPermission(handle, false, access);
+      if (permission !== 'granted') permission = await folderPermission(handle, true, access);
       if (permission !== 'granted') {
         throw new LibraryError(
-          this.access === 'read'
+          access === 'read'
             ? 'The browser did not grant access to the folder.'
             : 'The browser did not grant write access to the folder.',
         );
       }
       await this.store.set(FOLDER_HANDLE_KEY, handle);
-      await this.attachFolder(handle);
+      await this.store.set(FOLDER_ACCESS_KEY, access);
+      await this.attachFolder(handle, access);
       await this.memory.clear();
       this.lastDelete = null;
       this.set({ undoableDelete: null });
     });
   }
 
-  /** What UNLINK would copy, for the confirm dialog. */
+  /** What the tree holds, for the link confirm. */
   unlinkSummary(): { folders: number; openable: number; otherFiles: number } {
     return countContents(this.tree, this.policy);
   }
 
   /**
-   * UNLINK: copy the folder's structure and every file the policy's
-   * `copyOnUnlink` allows into the browser, then forget the folder. Other
-   * files stay on disk only (Nodestra ruling F4). Ids are kept, so the open
-   * file stays open.
-   *
-   * Everything is READ first and only then is the browser's store replaced —
-   * a read failure part-way used to leave an already-wiped store (FB-17).
-   * Unreadable files are skipped and reported, not fatal.
+   * What UNLINK would do, measured: counts, the total size KEEP would copy
+   * (file sizes are read from the folder's metadata, not the files), and
+   * the site's free storage. Show it BEFORE asking KEEP or REMOVE.
    */
-  unlink(): Promise<void> {
+  planUnlink(): Promise<UnlinkPlan> {
     return this.run(async () => {
-      if (this.mode.kind !== 'folder') {
-        // Nothing readable (reconnect pending): forget the folder.
-        await this.store.delete(FOLDER_HANDLE_KEY);
-        this.storedHandle = null;
-        this.backend = this.memory;
-        await this.memory.clear();
-        await this.memory.saveStructure(createEmptyTree());
-        this.set({ mode: { kind: 'memory' }, tree: createEmptyTree() });
-        return;
+      const counts = countContents(this.tree, this.policy);
+      const mode = this.snapshot.mode;
+      const folderName = mode.kind === 'folder' || mode.kind === 'reconnect' ? mode.folderName : '';
+      const keep = { folders: counts.folders, files: 0, bytes: 0, leftOnDisk: 0, unreadable: 0 };
+      if (mode.kind !== 'folder') {
+        return { mode: 'forget', folderName, ...counts, keep: { ...keep, folders: 0 }, storage: null, fits: null };
       }
-      const source = this.backend;
-      const before = this.tree;
-      let tree = before;
-      for (const node of Object.values(before.nodes)) {
-        if (node.kind === 'file' && !this.policy.copyOnUnlink(node) && tree.nodes[node.id]) {
-          tree = removeNode(tree, node.id).tree;
-        }
-      }
-      const contents = new Map<string, string | Blob>();
-      let skipped = 0;
-      for (const node of Object.values(tree.nodes)) {
+      for (const node of Object.values(this.tree.nodes)) {
         if (node.kind !== 'file') continue;
+        if (!this.policy.copyOnUnlink(node)) {
+          keep.leftOnDisk += 1;
+          continue;
+        }
         try {
-          contents.set(node.id, await this.readForCopy(source, before, node.id));
+          keep.bytes += (await this.backend.getFile(this.tree, node.id)).size;
+          keep.files += 1;
         } catch {
-          skipped += 1;
-          tree = removeNode(tree, node.id).tree;
+          keep.unreadable += 1;
         }
       }
-      await this.memory.clear();
-      for (const [id, data] of contents) await this.memory.write(tree, id, data);
+      const storage = await estimateStorage();
+      return {
+        mode: 'folder',
+        folderName,
+        ...counts,
+        keep,
+        storage,
+        fits: storage ? keep.bytes <= storage.available : null,
+      };
+    }, { write: false });
+  }
+
+  /**
+   * UNLINK — forget the linked folder. Nothing on disk is touched.
+   *
+   *  - `keep: true` (KEEP): every folder and every file the policy's
+   *    `copyOnUnlink` allows is copied into the browser first. Binary
+   *    contents STREAM into the blob store (OPFS), never through memory;
+   *    text is stored as strings. All-or-nothing: if the copy fails, runs out
+   *    of space or is cancelled (`signal`, `cancelUnlink()`), the partial
+   *    copy is deleted and the folder stays linked, unchanged. Files that
+   *    cannot be READ are skipped and reported in `notice`, not fatal. Ids
+   *    are kept, so the open file stays open.
+   *  - `keep: false` (REMOVE), or a folder awaiting reconnection: the
+   *    in-browser library ends up empty — no leftover folders.
+   *
+   * Asks the browser to keep the site's storage persistent before a copy.
+   */
+  unlink(options: UnlinkOptions): Promise<UnlinkResult> {
+    const controller = new AbortController();
+    this.unlinkController = controller;
+    const signal = options.signal ? anySignal(options.signal, controller.signal) : controller.signal;
+    return this.run(async () => {
+      try {
+        if (this.mode.kind !== 'folder' || !options.keep) {
+          await this.forgetFolder();
+          return { kept: 0, skipped: 0, bytes: 0 };
+        }
+        return await this.keepAndForget(signal, options.onProgress);
+      } catch (error) {
+        if (isAbort(error)) {
+          this.set({ notice: 'Unlink cancelled: the folder is still linked and nothing was copied.' });
+        }
+        throw error;
+      }
+    }).finally(() => {
+      if (this.unlinkController === controller) this.unlinkController = null;
+      if (this.snapshot.unlinkProgress) this.set({ unlinkProgress: null });
+    });
+  }
+
+  /** Cancel the KEEP copy in progress (the folder stays linked). */
+  cancelUnlink(): void {
+    this.unlinkController?.abort(new DOMException('The operation was cancelled.', 'AbortError'));
+  }
+
+  /** REMOVE: an empty in-browser library, the folder forgotten. */
+  private async forgetFolder(): Promise<void> {
+    await this.memory.clear();
+    await this.memory.saveStructure(createEmptyTree());
+    await this.store.delete(FOLDER_HANDLE_KEY);
+    await this.store.delete(FOLDER_ACCESS_KEY).catch(() => {});
+    this.storedHandle = null;
+    this.backend = this.memory;
+    this.accessState = this.defaultAccess;
+    this.lastDelete = null;
+    this.set({
+      mode: { kind: 'memory' },
+      tree: createEmptyTree(),
+      folderAccess: null,
+      unsupported: new Set(),
+      undoableDelete: null,
+    });
+  }
+
+  /**
+   * KEEP. Measure, check the room, copy everything, and only then switch:
+   * the structure is saved and the folder handle forgotten after the last
+   * byte landed. Any failure before that deletes what was copied — the
+   * folder stays linked and the browser's store stays empty, as it was
+   * (LINK empties it). Everything is READ before the store is relied on: a
+   * read failure part-way used to leave a wiped store (FB-17).
+   */
+  private async keepAndForget(
+    signal: AbortSignal,
+    onProgress: UnlinkOptions['onProgress'],
+  ): Promise<UnlinkResult> {
+    signal.throwIfAborted();
+    const source = this.backend;
+    const before = this.tree;
+    let tree = before;
+    for (const node of Object.values(before.nodes)) {
+      if (node.kind === 'file' && !this.policy.copyOnUnlink(node) && tree.nodes[node.id]) {
+        tree = removeNode(tree, node.id).tree;
+      }
+    }
+    // Disk-backed Files: opening one reads nothing.
+    const entries: { id: string; name: string; file: File }[] = [];
+    let skipped = 0;
+    for (const node of Object.values(tree.nodes)) {
+      if (node.kind !== 'file') continue;
+      try {
+        entries.push({ id: node.id, name: node.name, file: await source.getFile(before, node.id) });
+      } catch {
+        skipped += 1;
+        tree = removeNode(tree, node.id).tree;
+      }
+    }
+    const progress: UnlinkProgress = {
+      bytesCopied: 0,
+      bytesTotal: entries.reduce((sum, entry) => sum + entry.file.size, 0),
+      filesCopied: 0,
+      filesTotal: entries.length,
+      currentFile: null,
+    };
+    let lastReport = 0;
+    const report = (force = false) => {
+      const now = Date.now();
+      if (!force && now - lastReport < PROGRESS_INTERVAL_MS) return;
+      lastReport = now;
+      const copy = { ...progress };
+      this.set({ unlinkProgress: copy });
+      onProgress?.(copy);
+    };
+    report(true);
+
+    const storage = await estimateStorage();
+    if (storage && progress.bytesTotal > storage.available) {
+      throw new LibraryError(
+        `Not enough browser storage to keep a copy: it needs ${formatBytes(progress.bytesTotal)} and ${formatBytes(storage.available)} is free. Nothing was copied.`,
+      );
+    }
+    if (progress.bytesTotal > 0) await requestPersistentStorage();
+    signal.throwIfAborted();
+
+    const blobs = this.memory.blobs;
+    const streams = this.policy.content === 'binary' && blobs !== null;
+    const inMemory = new Map<string, string | Blob>();
+    try {
+      await this.memory.clear(); // empty while linked; leftovers of a crash go
+      const copyAll = async () => {
+        for (const entry of entries) {
+          signal.throwIfAborted();
+          progress.currentFile = entry.name;
+          report();
+          const base = progress.bytesCopied;
+          try {
+            if (streams) {
+              await this.memory.write(tree, entry.id, entry.file, {
+                signal,
+                onProgress: (written) => {
+                  progress.bytesCopied = base + written;
+                  report();
+                },
+              });
+            } else if (this.policy.content === 'text') {
+              inMemory.set(entry.id, await entry.file.text());
+            } else {
+              // No blob store (an in-memory library, or no OPFS): the store
+              // holds Blobs, so this one is read like the store itself.
+              inMemory.set(entry.id, new Blob([await entry.file.arrayBuffer()], { type: entry.file.type }));
+            }
+          } catch (error) {
+            // The SOURCE could not be read (changed or removed meanwhile):
+            // skip that file. Anything else — space, cancel — is fatal.
+            if (signal.aborted || !isSourceReadError(error)) throw error;
+            skipped += 1;
+            tree = removeNode(tree, entry.id).tree;
+            progress.bytesCopied = base;
+            continue;
+          }
+          progress.bytesCopied = base + entry.file.size;
+          progress.filesCopied += 1;
+          report();
+        }
+      };
+      if (streams) await withBlobLock(blobs!, 'shared', copyAll);
+      else await copyAll();
+      signal.throwIfAborted();
+      progress.currentFile = null;
+      report(true);
+      for (const [id, data] of inMemory) await this.memory.write(tree, id, data);
       await this.memory.saveStructure(tree);
       await this.store.delete(FOLDER_HANDLE_KEY);
-      this.storedHandle = null;
-      this.backend = this.memory;
-      this.set({
-        mode: { kind: 'memory' },
-        tree,
-        notice:
-          skipped > 0 ? `${skipped} file(s) could not be read and were not copied.` : null,
-      });
+    } catch (error) {
+      await this.memory.clear().catch(() => {});
+      throw error;
+    }
+    await this.store.delete(FOLDER_ACCESS_KEY).catch(() => {});
+    this.storedHandle = null;
+    this.backend = this.memory;
+    this.accessState = this.defaultAccess;
+    this.lastDelete = null;
+    this.set({
+      mode: { kind: 'memory' },
+      tree,
+      folderAccess: null,
+      undoableDelete: null,
+      notice: skipped > 0 ? `${skipped} file(s) could not be read and were not copied.` : null,
     });
+    return { kept: progress.filesCopied, skipped, bytes: progress.bytesCopied };
   }
 
   // ── files ─────────────────────────────────────────────────────────────
@@ -608,13 +973,17 @@ class FileLibrary {
             : `${present.length} items`,
         items: [],
       };
+      let hadFiles = false;
       for (const id of present) {
         for (const itemId of subtreeIds(this.tree, id)) {
           const node = this.tree.nodes[itemId];
           const path = pathOf(this.tree, itemId);
           if (node.kind === 'folder') {
             record.items.push({ path, kind: 'folder' });
-          } else if (this.policy.keepForUndo(node)) {
+            continue;
+          }
+          hadFiles = true;
+          if (this.policy.keepForUndo(node)) {
             const data = await this.readForCopy(this.backend, this.tree, itemId).catch(
               () => undefined,
             );
@@ -650,8 +1019,13 @@ class FileLibrary {
         }
         this.set({ notice: notes.join(' ') });
       }
-      this.lastDelete = record;
-      this.set({ undoableDelete: record.label });
+      // Offer Undo only when it would bring the delete back: files whose
+      // contents were kept, or a delete of folders alone. Deleted files of
+      // which nothing was kept (videos) make Undo a lie — not offered.
+      const restorable =
+        record.items.some((item) => item.kind === 'file' && item.data !== undefined) || !hadFiles;
+      this.lastDelete = restorable ? record : null;
+      this.set({ undoableDelete: restorable ? record.label : null });
     });
   }
 
@@ -704,10 +1078,10 @@ class FileLibrary {
   }
 
   /**
-   * Contents that must outlive their source (an unlinked folder, a deleted
-   * file). Text policies keep strings, the stored format Nodestra's libraries
-   * already hold. Binary contents are read into memory: a disk-backed File
-   * becomes unreadable once its file is gone, so a reference is not enough.
+   * Contents kept so a DELETE can be undone. Text policies keep strings, the
+   * stored format Nodestra's libraries already hold. Binary contents (only
+   * when a custom policy's `keepForUndo` asks) are read into memory: a
+   * disk-backed File becomes unreadable once its file is gone.
    */
   private async readForCopy(
     backend: LibraryBackend,
@@ -730,10 +1104,39 @@ class FileLibrary {
       this.mode.kind === 'reconnect'
         ? 'Reconnect the folder before changing it.'
         : this.mode.kind === 'folder'
-          ? 'This folder is linked read-only.'
+          ? 'This folder is open read-only. Switch it to Read & write to change it.'
           : 'The library is still loading.',
     );
   }
+}
+
+function isAbort(error: unknown): boolean {
+  return (
+    (error instanceof DOMException || error instanceof Error) && error.name === 'AbortError'
+  );
+}
+
+/** The source of a copy could not be read: changed or removed meanwhile. */
+function isSourceReadError(error: unknown): boolean {
+  return (
+    error instanceof DOMException &&
+    (error.name === 'NotReadableError' || error.name === 'NotFoundError')
+  );
+}
+
+/** Either signal aborts the result. */
+function anySignal(a: AbortSignal, b: AbortSignal): AbortSignal {
+  const any = (AbortSignal as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof any === 'function') return any.call(AbortSignal, [a, b]);
+  const controller = new AbortController();
+  for (const signal of [a, b]) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+  }
+  return controller.signal;
 }
 
 function describe(error: unknown): string {
@@ -763,4 +1166,12 @@ function describe(error: unknown): string {
 }
 
 export { FileLibrary };
-export type { FileLibraryOptions, LibraryMode, LibrarySnapshot };
+export type {
+  FileLibraryOptions,
+  LibraryMode,
+  LibrarySnapshot,
+  UnlinkOptions,
+  UnlinkPlan,
+  UnlinkProgress,
+  UnlinkResult,
+};

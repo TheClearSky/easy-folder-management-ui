@@ -3,7 +3,9 @@
  *
  *  - MemoryBackend: the browser's own storage (IndexedDB). The tree structure
  *    is one key, each file's contents another (a string, or a Blob for
- *    binary data). Survives a reload (Nodestra ruling F2).
+ *    binary data). With a `BlobStore` (OPFS), binary contents go there
+ *    instead, streamed, never through memory. Survives a reload (Nodestra
+ *    ruling F2).
  *  - FolderBackend: a real folder the user linked with the File System Access
  *    API. Every operation is mirrored to disk; the tree is re-read from disk.
  *
@@ -28,6 +30,8 @@ import {
 } from './libraryTree';
 import type { LibraryNode, LibraryTree } from './libraryTree';
 import type { KeyValueStore } from './keyValueStore';
+import { mediaTypeOf, withBlobLock } from './blobStore';
+import type { BlobStore } from './blobStore';
 
 type BackendKind = 'memory' | 'folder';
 
@@ -52,6 +56,10 @@ type WriteOptions = {
   /** Write starting at this byte offset, keeping the bytes before it — how
    *  an interrupted download resumes. */
   at?: number;
+  /** Abort a streamed write; the previous contents stay. */
+  signal?: AbortSignal;
+  /** Bytes written by this call so far, as chunks land. */
+  onProgress?(bytesWritten: number): void;
 };
 
 interface LibraryBackend {
@@ -94,18 +102,35 @@ const fileKey = (id: string) => `file:${id}`;
 class MemoryBackend implements LibraryBackend {
   readonly kind = 'memory' as const;
 
-  constructor(private readonly store: KeyValueStore) {}
+  /** `blobs`: where BINARY contents go (OPFS in a browser). Without one,
+   *  they are Blobs in the key-value store, as before 0.0.4. Text is always
+   *  a string in the key-value store. */
+  constructor(
+    private readonly store: KeyValueStore,
+    readonly blobs: BlobStore | null = null,
+  ) {}
 
+  /** Contents: the key-value entry first (text, and Blobs stored before a
+   *  blob store existed), then the blob store. */
   private async stored(id: string): Promise<string | Blob> {
     const value = await this.store.get<unknown>(fileKey(id));
     if (typeof value === 'string' || value instanceof Blob) return value;
+    const file = await this.blobs?.get(id);
+    if (file) return file;
     throw new LibraryError('This file has no stored content.');
   }
 
+  /** A blob-store entry is the browser's disk-backed file, re-wrapped only
+   *  to carry the library name (a File made from a File references it; no
+   *  bytes are copied). */
   async getFile(tree: LibraryTree, id: string): Promise<File> {
     const value = await this.stored(id);
     const name = tree.nodes[id]?.name ?? id;
-    return new File([value], name, value instanceof Blob ? { type: value.type } : undefined);
+    if (typeof value === 'string') return new File([value], name);
+    return new File([value], name, {
+      type: value.type || mediaTypeOf(name),
+      lastModified: value instanceof File ? value.lastModified : undefined,
+    });
   }
 
   async readText(_tree: LibraryTree, id: string): Promise<string> {
@@ -114,13 +139,32 @@ class MemoryBackend implements LibraryBackend {
   }
 
   /** Text stays a string (the format Nodestra's stored libraries already
-   *  hold); anything else is kept as a Blob, which IndexedDB stores natively. */
+   *  hold). Anything else streams into the blob store when there is one, or
+   *  is kept as a Blob, which IndexedDB stores natively. */
   async write(
     _tree: LibraryTree,
     id: string,
     data: WriteData,
     options: WriteOptions = {},
   ): Promise<void> {
+    const blobs = this.blobs;
+    if (blobs && typeof data !== 'string') {
+      await withBlobLock(blobs, 'shared', async () => {
+        if (options.at !== undefined) {
+          // Resuming a file whose head is still in the key-value store
+          // (written before the blob store existed): move the head first.
+          const legacy = await this.store.get<unknown>(fileKey(id));
+          if (typeof legacy === 'string' || legacy instanceof Blob) await blobs.put(id, legacy);
+        }
+        await blobs.put(id, data, {
+          at: options.at,
+          signal: options.signal,
+          onProgress: options.onProgress,
+        });
+      });
+      await this.store.delete(fileKey(id));
+      return;
+    }
     let value: string | Blob = typeof data === 'string' ? data : await toBlob(data);
     if (options.at !== undefined) {
       const existing = await this.stored(id).catch(() => '');
@@ -128,6 +172,7 @@ class MemoryBackend implements LibraryBackend {
       value = new Blob([head, value]);
     }
     await this.store.set(fileKey(id), value);
+    if (blobs) await blobs.delete(id);
   }
 
   async createFolder(_tree: LibraryTree, _id: string): Promise<void> {}
@@ -142,9 +187,12 @@ class MemoryBackend implements LibraryBackend {
     return null;
   }
 
+  /** Removes the contents too — a blob-store file's bytes are freed now. */
   async remove(before: LibraryTree, id: string): Promise<string | null> {
     for (const gone of subtreeIds(before, id)) {
-      if (before.nodes[gone].kind === 'file') await this.store.delete(fileKey(gone));
+      if (before.nodes[gone].kind !== 'file') continue;
+      await this.store.delete(fileKey(gone));
+      await this.blobs?.delete(gone);
     }
     return null;
   }
@@ -167,6 +215,39 @@ class MemoryBackend implements LibraryBackend {
     for (const key of await this.store.keys()) {
       if (key === TREE_KEY || key.startsWith('file:')) await this.store.delete(key);
     }
+    const blobs = this.blobs;
+    if (blobs) for (const key of await blobs.keys()) await blobs.delete(key);
+  }
+
+  /**
+   * Delete blob-store entries no file of the library refers to — left by a
+   * tab closed in the middle of a copy. Only when no other tab holds the
+   * store's lock (it may be writing), and never an entry changed in the
+   * last `graceMs` (written by a tab whose structure write is still on its
+   * way). Resolves how many entries were removed.
+   */
+  async sweep(referenced: ReadonlySet<string>, graceMs = 60_000): Promise<number> {
+    const blobs = this.blobs;
+    if (!blobs) return 0;
+    const removed = await withBlobLock(
+      blobs,
+      'exclusive',
+      async () => {
+        let count = 0;
+        for (const key of await blobs.keys()) {
+          if (referenced.has(key)) continue;
+          const file = await blobs.get(key).catch(() => undefined);
+          if (file && Date.now() - file.lastModified < graceMs) continue;
+          await blobs.delete(key).then(
+            () => (count += 1),
+            () => {},
+          );
+        }
+        return count;
+      },
+      true,
+    );
+    return removed ?? 0;
   }
 }
 
@@ -230,13 +311,34 @@ async function toBlob(data: Exclude<WriteData, string>): Promise<Blob> {
  * holds only the chunk in flight. The browser commits its swap file on
  * close, so a failure part-way leaves the previous contents untouched.
  */
-async function writeWhole(handle: FileSystemFileHandle, data: WriteData, at?: number) {
+async function writeWhole(
+  handle: FileSystemFileHandle,
+  data: WriteData,
+  at?: number,
+  options: Pick<WriteOptions, 'signal' | 'onProgress'> = {},
+) {
+  if (options.signal?.aborted) {
+    throw options.signal.reason ?? new DOMException('The operation was cancelled.', 'AbortError');
+  }
   const writable = await handle.createWritable({ keepExistingData: at !== undefined });
   try {
     if (at !== undefined) await writable.seek(at);
-    if (isStream(data)) {
+    if (isStream(data) || options.signal || options.onProgress) {
+      const source = isStream(data) ? data : (new Blob([data]).stream() as ReadableStream<Uint8Array>);
+      let written = 0;
+      const counted = options.onProgress
+        ? source.pipeThrough(
+            new TransformStream<Uint8Array, Uint8Array>({
+              transform(chunk, controller) {
+                written += chunk.byteLength;
+                options.onProgress?.(written);
+                controller.enqueue(chunk);
+              },
+            }),
+          )
+        : source;
       // pipeTo closes the writable on success and aborts it on failure.
-      await data.pipeTo(writable);
+      await counted.pipeTo(writable, { signal: options.signal });
       return;
     }
     await writable.write(data);
@@ -459,7 +561,7 @@ class FolderBackend implements LibraryBackend {
         }
       }
     }
-    await writeWhole(handle, data, options.at);
+    await writeWhole(handle, data, options.at, options);
     await this.remember(id, handle);
   }
 

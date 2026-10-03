@@ -7,6 +7,7 @@ import type {
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { cn } from './cn';
+import { useFolderTheme } from './theme/FolderThemeContext';
 
 /**
  * The open tabs, VS Code style: one row; the app decides what each tab shows.
@@ -19,6 +20,9 @@ import { cn } from './cn';
  *   Ctrl+Shift+←/→ move the tab · Shift+F10 / Menu key: the context menu.
  * Mouse: click opens, double-click keeps a preview tab, middle-click closes,
  * drag reorders.
+ * Touch: tap opens; a swipe SCROLLS the strip (it never starts a drag, which
+ * used to hijack the swipe); long-press opens the menu, whose Move Left /
+ * Move Right reorder. Touch screens get larger targets (`pointer-coarse`).
  *
  * The close "✕" is mouse-only (`aria-hidden`, out of the tab order): an
  * interactive control nested in a `role=tab` is invalid ARIA, and keyboard
@@ -36,6 +40,8 @@ type TabStripStrings = {
   closeSaved: string;
   closeAll: string;
   reopen: string;
+  moveLeft: string;
+  moveRight: string;
   unsaved: string;
   status: Record<Exclude<TabStatus, 'ok'>, string>;
   /** Shortcut hints shown in the menu; `''` hides one. */
@@ -52,6 +58,8 @@ const DEFAULT_STRINGS: TabStripStrings = {
   closeSaved: 'Close Saved',
   closeAll: 'Close All',
   reopen: 'Reopen Closed Tab',
+  moveLeft: 'Move Left',
+  moveRight: 'Move Right',
   unsaved: 'unsaved',
   status: { missing: 'deleted', ended: 'ended', loading: 'loading', error: 'error' },
   closeShortcut: '',
@@ -93,13 +101,19 @@ const EDGE_SCROLL_PX = 32;
 const MENU_CONTENT =
   'efm:z-1100 efm:min-w-[200px] efm:rounded-md efm:border efm:border-border efm:bg-surface-raised efm:p-1 efm:shadow-xl';
 const MENU_ITEM =
-  'efm:flex efm:cursor-pointer efm:items-center efm:justify-between efm:gap-6 efm:rounded efm:px-2 efm:py-1 efm:text-[12px] efm:text-fg efm:outline-none efm:select-none efm:data-[disabled]:cursor-default efm:data-[disabled]:opacity-40 efm:data-[highlighted]:bg-hover';
+  'efm:flex efm:cursor-pointer efm:items-center efm:justify-between efm:gap-6 efm:rounded efm:px-2 efm:py-1 efm:text-[12px] efm:text-fg efm:outline-none efm:select-none efm:data-[disabled]:cursor-default efm:data-[disabled]:opacity-40 efm:data-[highlighted]:bg-hover efm:pointer-coarse:py-2.5 efm:pointer-coarse:text-[14px]';
 
 function TabStrip(props: TabStripProps) {
   const { order, active, label, onActivate, onClose, onReorder, panelId } = props;
   const strings = { ...DEFAULT_STRINGS, ...props.strings };
   const isDirty = props.isDirty ?? (() => false);
   const status = props.status ?? (() => 'ok' as const);
+  const theme = useFolderTheme();
+  const slots = theme?.tabStrip;
+  const menu = theme?.menu;
+  const tabMenuItem = cn(MENU_ITEM, menu?.item, slots?.tabMenuItem);
+  const menuHint = cn('efm:text-fg-muted', menu?.hint);
+  const menuSeparator = cn('efm:my-1 efm:h-px efm:bg-border', menu?.separator);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef(new Map<string, HTMLDivElement>());
   const [focusId, setFocusId] = useState<string | null>(active);
@@ -177,7 +191,8 @@ function TabStrip(props: TabStripProps) {
     return index;
   };
   const onPointerDown = (event: ReactPointerEvent, id: string) => {
-    if (event.button !== 0) return;
+    // A finger on the strip means "scroll": never start a drag from touch.
+    if (event.button !== 0 || event.pointerType === 'touch') return;
     setDrag({ id, startX: event.clientX, moving: false, dropIndex: order.indexOf(id) });
   };
   useEffect(() => {
@@ -230,7 +245,8 @@ function TabStrip(props: TabStripProps) {
     <div
       data-efm='tab-strip'
       className={cn(
-        'efm:flex efm:h-[34px] efm:flex-none efm:items-stretch efm:border-b efm:border-border efm:bg-surface',
+        'efm:flex efm:h-[34px] efm:flex-none efm:items-stretch efm:border-b efm:border-border efm:bg-surface efm:pointer-coarse:h-[42px]',
+        slots?.root,
         props.className,
       )}
     >
@@ -241,7 +257,10 @@ function TabStrip(props: TabStripProps) {
         onWheel={(event) => {
           if (event.deltaY !== 0 && scrollerRef.current) scrollerRef.current.scrollLeft += event.deltaY;
         }}
-        className='efm:flex efm:min-w-0 efm:flex-1 efm:items-stretch efm:overflow-x-auto efm:[scrollbar-width:thin]'
+        className={cn(
+          'efm:flex efm:min-w-0 efm:flex-1 efm:items-stretch efm:overflow-x-auto efm:[scrollbar-width:thin]',
+          slots?.tablist,
+        )}
       >
         {order.map((id) => {
           const selected = id === active;
@@ -284,21 +303,25 @@ function TabStrip(props: TabStripProps) {
                   }}
                   onPointerDown={(event) => onPointerDown(event, id)}
                   className={cn(
-                    'efm:group efm:relative efm:flex efm:max-w-[220px] efm:flex-none efm:cursor-pointer efm:items-center efm:gap-1.5 efm:border-r efm:border-border efm:pr-1.5 efm:pl-3 efm:text-[12px] efm:outline-none efm:select-none efm:focus-visible:shadow-[inset_0_0_0_1px_var(--efm-accent)]',
+                    'efm:group efm:relative efm:flex efm:max-w-[220px] efm:flex-none efm:cursor-pointer efm:items-center efm:gap-1.5 efm:border-r efm:border-border efm:pr-1.5 efm:pl-3 efm:text-[12px] efm:outline-none efm:select-none efm:[-webkit-touch-callout:none] efm:focus-visible:shadow-[inset_0_0_0_1px_var(--efm-focus,var(--efm-accent))] efm:pointer-coarse:text-[13px]',
                     selected
                       ? 'efm:bg-surface-raised efm:text-fg efm:shadow-[inset_0_2px_0_var(--efm-accent)]'
                       : 'efm:text-fg-muted efm:hover:bg-surface-raised/60 efm:hover:text-fg',
                     dragging?.id === id && 'efm:opacity-50',
+                    slots?.tab,
+                    selected ? slots?.tabActive : slots?.tabInactive,
+                    isPreview && slots?.tabPreview,
+                    dragging?.id === id && slots?.tabDragging,
                   )}
                 >
                   {indicatorBefore === id && (
                     <span
                       aria-hidden='true'
-                      className='efm:absolute efm:top-1 efm:bottom-1 efm:-left-px efm:w-0.5 efm:bg-accent'
+                      className={cn('efm:absolute efm:top-1 efm:bottom-1 efm:-left-px efm:w-0.5 efm:bg-accent', slots?.dropIndicator)}
                     />
                   )}
                   {props.renderIcon && (
-                    <span aria-hidden='true' className='efm:flex efm:flex-none efm:items-center'>
+                    <span aria-hidden='true' className={cn('efm:flex efm:flex-none efm:items-center', slots?.tabIcon)}>
                       {props.renderIcon(id)}
                     </span>
                   )}
@@ -309,6 +332,10 @@ function TabStrip(props: TabStripProps) {
                       tabStatus === 'missing' && 'efm:line-through efm:opacity-70',
                       (tabStatus === 'ended' || tabStatus === 'loading') && 'efm:opacity-60',
                       tabStatus === 'error' && 'efm:text-danger',
+                      slots?.tabLabel,
+                      isPreview && slots?.tabLabelPreview,
+                      tabStatus === 'missing' && slots?.tabLabelMissing,
+                      tabStatus === 'error' && slots?.tabLabelError,
                     )}
                   >
                     {name}
@@ -322,10 +349,13 @@ function TabStrip(props: TabStripProps) {
                       event.stopPropagation();
                       onClose([id]);
                     }}
-                    className='efm:relative efm:flex efm:h-[18px] efm:w-[18px] efm:flex-none efm:cursor-pointer efm:items-center efm:justify-center efm:rounded efm:text-[11px] efm:hover:bg-hover'
+                    className={cn(
+                      'efm:relative efm:flex efm:h-[18px] efm:w-[18px] efm:flex-none efm:cursor-pointer efm:items-center efm:justify-center efm:rounded efm:text-[11px] efm:hover:bg-hover efm:pointer-coarse:h-7 efm:pointer-coarse:w-7 efm:pointer-coarse:text-[13px]',
+                      slots?.closeButton,
+                    )}
                   >
                     {/* A dirty dot until hovered, then the ✕, like VS Code. */}
-                    <span className={cn(dirty ? 'efm:group-hover:hidden' : 'efm:hidden')}>●</span>
+                    <span className={cn(dirty ? 'efm:group-hover:hidden' : 'efm:hidden', slots?.dirtyMark)}>●</span>
                     <span
                       className={cn(
                         dirty
@@ -341,14 +371,33 @@ function TabStrip(props: TabStripProps) {
                 </div>
               </ContextMenu.Trigger>
               <ContextMenu.Portal>
-                <ContextMenu.Content className={MENU_CONTENT} data-efm='tab-menu'>
-                  <ContextMenu.Item className={MENU_ITEM} onSelect={() => onClose([id])}>
+                <ContextMenu.Content className={cn(MENU_CONTENT, menu?.content, slots?.tabMenu)} data-efm='tab-menu'>
+                  <ContextMenu.Item className={tabMenuItem} onSelect={() => onClose([id])}>
                     {strings.close}
-                    {strings.closeShortcut && <span className='efm:text-fg-muted'>{strings.closeShortcut}</span>}
+                    {strings.closeShortcut && <span className={menuHint}>{strings.closeShortcut}</span>}
                   </ContextMenu.Item>
+                  {order.length > 1 && (
+                    <>
+                      <ContextMenu.Item
+                        className={tabMenuItem}
+                        disabled={order.indexOf(id) === 0}
+                        onSelect={() => onReorder(id, order.indexOf(id) - 1)}
+                      >
+                        {strings.moveLeft}
+                      </ContextMenu.Item>
+                      <ContextMenu.Item
+                        className={tabMenuItem}
+                        disabled={order.indexOf(id) === order.length - 1}
+                        onSelect={() => onReorder(id, order.indexOf(id) + 1)}
+                      >
+                        {strings.moveRight}
+                      </ContextMenu.Item>
+                      <ContextMenu.Separator className={menuSeparator} />
+                    </>
+                  )}
                   {props.onCloseOthers && (
                     <ContextMenu.Item
-                      className={MENU_ITEM}
+                      className={tabMenuItem}
                       disabled={order.length < 2}
                       onSelect={() => props.onCloseOthers?.(id)}
                     >
@@ -357,7 +406,7 @@ function TabStrip(props: TabStripProps) {
                   )}
                   {props.onCloseRight && (
                     <ContextMenu.Item
-                      className={MENU_ITEM}
+                      className={tabMenuItem}
                       disabled={order.indexOf(id) === order.length - 1}
                       onSelect={() => props.onCloseRight?.(id)}
                     >
@@ -365,22 +414,22 @@ function TabStrip(props: TabStripProps) {
                     </ContextMenu.Item>
                   )}
                   {props.onCloseSaved && (
-                    <ContextMenu.Item className={MENU_ITEM} onSelect={props.onCloseSaved}>
+                    <ContextMenu.Item className={tabMenuItem} onSelect={props.onCloseSaved}>
                       {strings.closeSaved}
                     </ContextMenu.Item>
                   )}
                   {props.onCloseAll && (
-                    <ContextMenu.Item className={MENU_ITEM} onSelect={props.onCloseAll}>
+                    <ContextMenu.Item className={tabMenuItem} onSelect={props.onCloseAll}>
                       {strings.closeAll}
                     </ContextMenu.Item>
                   )}
                   {props.onReopen && (
                     <>
-                      <ContextMenu.Separator className='efm:my-1 efm:h-px efm:bg-border' />
-                      <ContextMenu.Item className={MENU_ITEM} onSelect={props.onReopen}>
+                      <ContextMenu.Separator className={menuSeparator} />
+                      <ContextMenu.Item className={tabMenuItem} onSelect={props.onReopen}>
                         {strings.reopen}
                         {strings.reopenShortcut && (
-                          <span className='efm:text-fg-muted'>{strings.reopenShortcut}</span>
+                          <span className={menuHint}>{strings.reopenShortcut}</span>
                         )}
                       </ContextMenu.Item>
                     </>
@@ -391,7 +440,7 @@ function TabStrip(props: TabStripProps) {
           );
         })}
         {indicatorAtEnd && (
-          <span aria-hidden='true' className='efm:my-1 efm:w-0.5 efm:flex-none efm:bg-accent' />
+          <span aria-hidden='true' className={cn('efm:my-1 efm:w-0.5 efm:flex-none efm:bg-accent', slots?.dropIndicator)} />
         )}
       </div>
       {/* Every open tab, for when the strip overflows: a real menu (arrow
@@ -400,14 +449,17 @@ function TabStrip(props: TabStripProps) {
         <DropdownMenu.Trigger
           aria-label={strings.allTabs}
           title={strings.allTabs}
-          className='efm:flex-none efm:cursor-pointer efm:border-l efm:border-border efm:px-2 efm:text-[12px] efm:text-fg-muted efm:outline-none efm:hover:bg-surface-raised efm:hover:text-fg efm:focus-visible:shadow-[inset_0_0_0_1px_var(--efm-accent)]'
+          className={cn(
+            'efm:flex-none efm:cursor-pointer efm:border-l efm:border-border efm:px-2 efm:text-[12px] efm:text-fg-muted efm:outline-none efm:hover:bg-surface-raised efm:hover:text-fg efm:focus-visible:shadow-[inset_0_0_0_1px_var(--efm-focus,var(--efm-accent))] efm:pointer-coarse:px-4 efm:pointer-coarse:text-[15px]',
+            slots?.overflowButton,
+          )}
         >
           ⌄
         </DropdownMenu.Trigger>
         <DropdownMenu.Portal>
           <DropdownMenu.Content
             align='end'
-            className={cn(MENU_CONTENT, 'efm:max-h-80 efm:overflow-auto')}
+            className={cn(MENU_CONTENT, 'efm:max-h-80 efm:overflow-auto', menu?.content, slots?.overflowMenu)}
             data-efm='all-tabs-menu'
           >
             <DropdownMenu.RadioGroup value={active ?? ''} onValueChange={onActivate}>
@@ -415,7 +467,12 @@ function TabStrip(props: TabStripProps) {
                 <DropdownMenu.RadioItem
                   key={id}
                   value={id}
-                  className={cn(MENU_ITEM, id !== active && 'efm:text-fg-muted')}
+                  className={cn(
+                    MENU_ITEM,
+                    id !== active && 'efm:text-fg-muted',
+                    menu?.item,
+                    id === active ? slots?.overflowItemActive : slots?.overflowItem,
+                  )}
                 >
                   <span
                     className={cn(

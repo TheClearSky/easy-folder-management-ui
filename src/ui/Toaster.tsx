@@ -1,5 +1,7 @@
 import { createContext, useContext, useEffect, useSyncExternalStore } from 'react';
 import type { ReactNode } from 'react';
+import { cn } from './cn';
+import { useFolderTheme } from './theme/FolderThemeContext';
 
 /**
  * A tiny toast system, ported from Nodestra (its ruling L6: our own, no
@@ -63,16 +65,23 @@ function ToastItem({ store, toast, paused }: { store: ToastStore; toast: Toast; 
     const handle = window.setTimeout(() => store.dismiss(toast.id), toast.timeoutMs);
     return () => window.clearTimeout(handle);
   }, [store, toast, paused]);
+  const slots = useFolderTheme()?.toaster;
   return (
     <div
       role='status'
-      className='efm:pointer-events-auto efm:flex efm:max-w-[420px] efm:items-center efm:gap-3 efm:rounded-md efm:border efm:border-border efm:bg-surface-raised efm:px-3 efm:py-2 efm:text-[13px] efm:text-fg efm:shadow-lg'
+      className={cn(
+        'efm:pointer-events-auto efm:flex efm:max-w-[420px] efm:items-center efm:gap-3 efm:rounded-md efm:border efm:border-border efm:bg-surface-raised efm:px-3 efm:py-2 efm:text-[13px] efm:text-fg efm:shadow-lg',
+        slots?.toast,
+      )}
     >
-      <span className='efm:min-w-0 efm:flex-1'>{toast.message}</span>
+      <span className={cn('efm:min-w-0 efm:flex-1', slots?.message)}>{toast.message}</span>
       {toast.action && (
         <button
           type='button'
-          className='efm:cursor-pointer efm:rounded efm:px-2 efm:py-0.5 efm:text-[12px] efm:font-semibold efm:text-accent efm:hover:bg-hover'
+          className={cn(
+            'efm:cursor-pointer efm:rounded efm:px-2 efm:py-0.5 efm:text-[12px] efm:font-semibold efm:text-accent efm:hover:bg-hover',
+            slots?.action,
+          )}
           onClick={() => {
             toast.action?.run();
             store.dismiss(toast.id);
@@ -84,7 +93,7 @@ function ToastItem({ store, toast, paused }: { store: ToastStore; toast: Toast; 
       <button
         type='button'
         aria-label='Dismiss'
-        className='efm:cursor-pointer efm:rounded efm:px-1 efm:text-fg-muted efm:hover:bg-hover efm:hover:text-fg'
+        className={cn('efm:cursor-pointer efm:rounded efm:px-1 efm:text-fg-muted efm:hover:bg-hover efm:hover:text-fg', slots?.close)}
         onClick={() => store.dismiss(toast.id)}
       >
         ✕
@@ -101,13 +110,17 @@ function ToastItem({ store, toast, paused }: { store: ToastStore; toast: Toast; 
  */
 function Toaster({ store, paused = false, children }: { store: ToastStore; paused?: boolean; children?: ReactNode }) {
   const current = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
+  const slots = useFolderTheme()?.toaster;
   return (
     <ToasterContext.Provider value={store}>
       {children}
       {current.length > 0 && (
         <div
           data-efm='toaster'
-          className='efm:pointer-events-none efm:fixed efm:right-4 efm:bottom-4 efm:z-900 efm:flex efm:flex-col efm:items-end efm:gap-2'
+          className={cn(
+            'efm:pointer-events-none efm:fixed efm:right-4 efm:bottom-4 efm:z-900 efm:flex efm:flex-col efm:items-end efm:gap-2',
+            slots?.viewport,
+          )}
         >
           {current.map((toast) => (
             <ToastItem key={toast.id} store={store} toast={toast} paused={paused} />

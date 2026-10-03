@@ -5,8 +5,8 @@
  *
  * Every rule that used to be "is it a `.json` graph?" asks the policy:
  * which files open (others are shown greyed), which entries a folder scan
- * skips, what extension a new file gets, and which files UNLINK and UNDO are
- * allowed to copy into memory.
+ * skips, what extension a new file gets, and which files UNLINK (when the
+ * user keeps a copy) and UNDO are allowed to copy into the browser.
  */
 
 import type { LibraryNode } from './libraryTree';
@@ -23,8 +23,9 @@ interface FilePolicy {
   /** `'text'`: contents are small strings the library may hold in memory.
    *  `'binary'`: contents are only ever streamed (a 4 GB video). */
   readonly content: 'text' | 'binary';
-  /** UNLINK copies these files into the browser's store; the rest stay on
-   *  disk only. */
+  /** UNLINK with KEEP copies these files into the browser's store (binary
+   *  contents stream into OPFS, never through memory); the rest stay on disk
+   *  only. */
   copyOnUnlink(node: LibraryNode): boolean;
   /** A delete keeps these files' contents in memory so it can be undone. */
   keepForUndo(node: LibraryNode): boolean;
@@ -43,10 +44,11 @@ type ExtensionPolicyOptions = {
 };
 
 /**
- * The common policy: a file opens when its extension is listed. Text files
- * travel with UNLINK and survive a deleted-then-undone round trip; binary
- * files never do (copying a video into IndexedDB, or holding it in memory
- * for an undo, is never what a user wants).
+ * The common policy: a file opens when its extension is listed. Openable
+ * files travel with UNLINK when the user chooses to keep a copy (a video is
+ * streamed into the browser's file system, never read into memory). Only
+ * TEXT files survive a deleted-then-undone round trip: holding a video in
+ * memory for an undo is never what a user wants.
  */
 function extensionPolicy(options: ExtensionPolicyOptions): FilePolicy {
   const extensions = options.openable.map(nameKey);
@@ -54,14 +56,14 @@ function extensionPolicy(options: ExtensionPolicyOptions): FilePolicy {
     const key = nameKey(name);
     return extensions.some((extension) => key.endsWith(extension));
   };
-  const textAndOpenable = (node: LibraryNode) =>
-    options.content === 'text' && node.kind === 'file' && isOpenable(node.name);
+  const openableFile = (node: LibraryNode) => node.kind === 'file' && isOpenable(node.name);
+  const textAndOpenable = (node: LibraryNode) => options.content === 'text' && openableFile(node);
   return {
     isOpenable,
     isHidden: options.isHidden ?? isHiddenEntry,
     defaultExtension: options.defaultExtension,
     content: options.content,
-    copyOnUnlink: options.copyOnUnlink ?? textAndOpenable,
+    copyOnUnlink: options.copyOnUnlink ?? openableFile,
     keepForUndo: options.keepForUndo ?? textAndOpenable,
   };
 }
