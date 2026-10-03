@@ -122,7 +122,7 @@ function App() {
               <WelcomeLayout title='▶ watch-together'>
                 <WelcomeSection title='Start'>
                   <WelcomeAction onClick={() => {}}>📁 Link a video folder…</WelcomeAction>
-                  <WelcomeAction onClick={() => void unsaved.ask(['ep02.mkv'])}>Open the unsaved dialog</WelcomeAction>
+                  <WelcomeAction onClick={() => void unsaved.ask(['ep02.mkv'])}>Try the unsaved-changes dialog</WelcomeAction>
                 </WelcomeSection>
                 <WelcomeSection title='Room'>
                   <WelcomeAction
@@ -153,13 +153,39 @@ function App() {
                 ]}
               />
             ) : (
-              <div style={{ padding: 24 }}>Content of {tabs.active}</div>
+              <ContentPreview label={label(tabs.active!)} kind={active?.kind ?? 'file'} />
             )}
           </div>
         </div>
       </div>
       {unsaved.element}
     </Toaster>
+  );
+}
+
+/** What an app renders for a tab — the library only decides WHICH tab is
+ *  shown. A stand-in "player" so screenshots look like a real app. */
+function ContentPreview({ label, kind }: { label: string; kind: string }) {
+  return (
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#111' }}>
+      <div
+        style={{
+          flex: 1,
+          margin: 24,
+          borderRadius: 10,
+          display: 'grid',
+          placeItems: 'center',
+          background: 'radial-gradient(circle at 30% 25%, #2b4a7a 0%, #1a2238 45%, #0d0f16 100%)',
+          boxShadow: 'inset 0 0 0 1px #2a2f3a',
+        }}
+      >
+        <div style={{ textAlign: 'center', color: '#e6e6e6' }}>
+          <div style={{ fontSize: 56, lineHeight: 1, opacity: 0.9 }}>{kind === 'share' ? '📡' : '▶'}</div>
+          <div style={{ marginTop: 14, fontSize: 18 }}>{label}</div>
+          <div style={{ marginTop: 6, fontSize: 12, color: '#8a94a6' }}>your app renders the tab here</div>
+        </div>
+      </div>
+    </div>
   );
 }
 
